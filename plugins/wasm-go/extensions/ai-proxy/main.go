@@ -343,6 +343,11 @@ func onHttpRequestBody(ctx wrapper.HttpContext, pluginConfig config.PluginConfig
 		body = newBody
 		action, err := handler.OnRequestBody(ctx, apiName, body)
 		if err == nil {
+			if action == types.ActionContinue {
+				if prefixCacheAction, handled := providerConfig.ApplyPrefixCacheToken(ctx, apiName, body); handled {
+					return prefixCacheAction
+				}
+			}
 			return action
 		}
 		log.Errorf("[onHttpRequestBody] failed to process request body, apiName=%s, err=%v", apiName, err)

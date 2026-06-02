@@ -717,6 +717,11 @@ func (c *ProviderConfig) GetApiTokenInUse(ctx wrapper.HttpContext) string {
 	return token
 }
 
+func (c *ProviderConfig) OverrideApiTokenInUse(ctx wrapper.HttpContext, apiToken string) {
+	ctx.SetContext(ctxKeyApiKey, apiToken)
+	ctx.SetContext(c.failover.ctxApiTokenInUse, apiToken)
+}
+
 func (c *ProviderConfig) SetApiTokenInUse(ctx wrapper.HttpContext) {
 	var apiToken string
 	// if enable apiToken failover, only use available apiToken from global apiTokens list

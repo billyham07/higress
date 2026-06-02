@@ -316,6 +316,9 @@ type ProviderConfig struct {
 	// @Title zh-CN API Tokens
 	// @Description zh-CN 在请求AI服务时用于认证的API Token列表。不同的AI服务提供商可能有不同的名称。部分供应商只支持配置一个API Token（如Azure OpenAI）。
 	apiTokens []string `required:"false" yaml:"apiTokens" json:"apiTokens"`
+	// @Title zh-CN API Token 选择策略
+	// @Description zh-CN 用于控制多 API Token 场景下的选择方式。默认随机选择；prefix_cache 会根据 prompt 前缀通过 Redis 固定选择同一个 token。
+	tokenSelection TokenSelectionConfig `required:"false" yaml:"tokenSelection" json:"tokenSelection"`
 	// @Title zh-CN 请求超时
 	// @Description zh-CN 请求AI服务的超时时间，单位为毫秒。默认值为120000，即2分钟。此项配置目前仅用于获取上下文信息，并不影响实际转发大模型请求。
 	timeout uint32 `required:"false" yaml:"timeout" json:"timeout"`
@@ -560,6 +563,7 @@ func (c *ProviderConfig) FromJson(json gjson.Result) {
 	for _, token := range json.Get("apiTokens").Array() {
 		c.apiTokens = append(c.apiTokens, token.String())
 	}
+	c.tokenSelection.FromJson(json.Get("tokenSelection"))
 	c.timeout = uint32(json.Get("timeout").Uint())
 	if c.timeout == 0 {
 		c.timeout = defaultTimeout
@@ -781,6 +785,9 @@ func (c *ProviderConfig) Validate() error {
 		if err := c.failover.Validate(); err != nil {
 			return err
 		}
+	}
+	if err := c.tokenSelection.Validate(c); err != nil {
+		return err
 	}
 
 	if c.typ == "" {
