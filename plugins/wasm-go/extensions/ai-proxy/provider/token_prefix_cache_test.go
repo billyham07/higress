@@ -40,6 +40,39 @@ func TestTokenPrefixCachePromptPrefixHashes(t *testing.T) {
 	require.NotEqual(t, hashes, config.promptPrefixHashes("provider-b", body))
 }
 
+func TestTokenPrefixCachePromptPrefixHashesAnthropicMessages(t *testing.T) {
+	config := TokenPrefixCacheConfig{
+		trimSpace:          true,
+		collapseWhitespace: true,
+	}
+	body := []byte(`{
+		"system": [{"type":"text","text":"You are helpful."}],
+		"messages": [
+			{"role":"user","content":[{"type":"text","text":"hi"}]},
+			{"role":"assistant","content":[{"type":"text","text":"hello"}]},
+			{"role":"user","content":[{"type":"text","text":"write a poem"}]}
+		]
+	}`)
+
+	hashes := config.promptPrefixHashes("provider-a", body)
+
+	require.Len(t, hashes, 2)
+	require.Len(t, hashes[0].(string), 40)
+	require.Len(t, hashes[1].(string), 40)
+	require.NotEqual(t, hashes[0], hashes[1])
+	require.Equal(t, hashes, config.promptPrefixHashes("provider-a", body))
+	require.NotEqual(t, hashes, config.promptPrefixHashes("provider-a", []byte(`{
+		"system": "You are strict.",
+		"messages": [{"role":"user","content":[{"type":"text","text":"hi"}]}]
+	}`)))
+}
+
+func TestTokenPrefixCacheSupportedAPI(t *testing.T) {
+	require.True(t, isPrefixCacheSupportedAPI(ApiNameChatCompletion))
+	require.True(t, isPrefixCacheSupportedAPI(ApiNameAnthropicMessages))
+	require.False(t, isPrefixCacheSupportedAPI(ApiNameCompletion))
+}
+
 func TestProviderConfigTokenIDs(t *testing.T) {
 	config := ProviderConfig{
 		apiTokens: []string{"sk-a", "sk-b", "sk-c"},

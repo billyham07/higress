@@ -218,10 +218,14 @@ func (c *TokenPrefixCacheConfig) Init() error {
 }
 
 func (c *ProviderConfig) ApplyPrefixCacheToken(ctx wrapper.HttpContext, apiName ApiName, body []byte) (types.Action, bool) {
-	if !c.tokenSelection.IsPrefixCacheEnabled() || apiName != ApiNameChatCompletion {
+	if !c.tokenSelection.IsPrefixCacheEnabled() || !isPrefixCacheSupportedAPI(apiName) {
 		return types.ActionContinue, false
 	}
 	return c.tokenSelection.prefixCache.Apply(ctx, c, body)
+}
+
+func isPrefixCacheSupportedAPI(apiName ApiName) bool {
+	return apiName == ApiNameChatCompletion || apiName == ApiNameAnthropicMessages
 }
 
 func (c *TokenPrefixCacheConfig) Apply(ctx wrapper.HttpContext, providerConfig *ProviderConfig, body []byte) (types.Action, bool) {
@@ -279,7 +283,7 @@ func (c *TokenPrefixCacheConfig) promptPrefixHashes(providerID string, body []by
 	}
 
 	params := make([]interface{}, 0, len(messages))
-	raw := ""
+	raw := c.promptPrefixSystem(body)
 	namespace := providerID
 	if namespace == "" {
 		namespace = "default"
@@ -289,7 +293,7 @@ func (c *TokenPrefixCacheConfig) promptPrefixHashes(providerID string, body []by
 			return nil
 		}
 		role := obj.Get("role").String()
-		content := c.normalizePromptContent(obj.Get("content").String())
+		content := c.normalizePromptContent(c.promptContentText(obj.Get("content")))
 		raw += role + ":" + content
 		if role == roleUser || index == len(messages)-1 {
 			params = append(params, computeTokenPrefixSHA1(namespace+"\x00"+raw))
@@ -297,6 +301,36 @@ func (c *TokenPrefixCacheConfig) promptPrefixHashes(providerID string, body []by
 		}
 	}
 	return params
+}
+
+func (c *TokenPrefixCacheConfig) promptPrefixSystem(body []byte) string {
+	system := gjson.GetBytes(body, "system")
+	if !system.Exists() {
+		return ""
+	}
+	return "system:" + c.normalizePromptContent(c.promptContentText(system))
+}
+
+func (c *TokenPrefixCacheConfig) promptContentText(content gjson.Result) string {
+	if content.IsArray() {
+		parts := make([]string, 0)
+		content.ForEach(func(_, block gjson.Result) bool {
+			if block.Type == gjson.String {
+				parts = append(parts, block.String())
+				return true
+			}
+			if text := block.Get("text"); text.Exists() {
+				parts = append(parts, text.String())
+				return true
+			}
+			if nested := block.Get("content"); nested.Exists() {
+				parts = append(parts, c.promptContentText(nested))
+			}
+			return true
+		})
+		return strings.Join(parts, "\n")
+	}
+	return content.String()
 }
 
 func (c *TokenPrefixCacheConfig) normalizePromptContent(content string) string {
