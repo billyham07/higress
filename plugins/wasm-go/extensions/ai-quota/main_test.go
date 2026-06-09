@@ -301,6 +301,50 @@ func TestOnHttpStreamingResponseBody(t *testing.T) {
 	})
 }
 
+func TestGetQuotaToken(t *testing.T) {
+	tests := []struct {
+		name        string
+		totalToken  any
+		inputToken  any
+		outputToken any
+		wantToken   int64
+		wantOK      bool
+	}{
+		{
+			name:        "prefer total token",
+			totalToken:  int64(7),
+			inputToken:  int64(1),
+			outputToken: int64(2),
+			wantToken:   7,
+			wantOK:      true,
+		},
+		{
+			name:        "fallback to input plus output",
+			totalToken:  int64(0),
+			inputToken:  int64(1),
+			outputToken: int64(2),
+			wantToken:   3,
+			wantOK:      true,
+		},
+		{
+			name:        "missing input output",
+			totalToken:  nil,
+			inputToken:  nil,
+			outputToken: int64(2),
+			wantToken:   0,
+			wantOK:      false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			token, ok := getQuotaToken(tt.totalToken, tt.inputToken, tt.outputToken)
+			require.Equal(t, tt.wantOK, ok)
+			require.Equal(t, tt.wantToken, token)
+		})
+	}
+}
+
 func TestGetOperationMode(t *testing.T) {
 	tests := []struct {
 		name      string

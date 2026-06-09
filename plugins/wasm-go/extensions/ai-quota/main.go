@@ -247,6 +247,7 @@ func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config QuotaConfig, da
 	if usage := tokenusage.GetTokenUsage(ctx, data); usage.TotalToken > 0 {
 		ctx.SetContext(tokenusage.CtxKeyInputToken, usage.InputToken)
 		ctx.SetContext(tokenusage.CtxKeyOutputToken, usage.OutputToken)
+		ctx.SetContext(tokenusage.CtxKeyTotalToken, usage.TotalToken)
 	}
 
 	// chat completion mode
@@ -254,17 +255,32 @@ func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config QuotaConfig, da
 		return data
 	}
 
-	if ctx.GetContext(tokenusage.CtxKeyInputToken) == nil || ctx.GetContext(tokenusage.CtxKeyOutputToken) == nil || ctx.GetContext("consumer") == nil {
+	if ctx.GetContext("consumer") == nil {
 		return data
 	}
 
-	inputToken := ctx.GetContext(tokenusage.CtxKeyInputToken).(int64)
-	outputToken := ctx.GetContext(tokenusage.CtxKeyOutputToken).(int64)
+	totalToken, ok := getQuotaToken(ctx.GetContext(tokenusage.CtxKeyTotalToken), ctx.GetContext(tokenusage.CtxKeyInputToken), ctx.GetContext(tokenusage.CtxKeyOutputToken))
+	if !ok {
+		return data
+	}
+
 	consumer := ctx.GetContext("consumer").(string)
-	totalToken := int(inputToken + outputToken)
 	log.Debugf("update consumer:%s, totalToken:%d", consumer, totalToken)
-	config.redisClient.DecrBy(config.RedisKeyPrefix+consumer, totalToken, nil)
+	config.redisClient.DecrBy(config.RedisKeyPrefix+consumer, int(totalToken), nil)
 	return data
+}
+
+func getQuotaToken(totalTokenValue any, inputTokenValue any, outputTokenValue any) (int64, bool) {
+	if totalToken, ok := totalTokenValue.(int64); ok && totalToken > 0 {
+		return totalToken, true
+	}
+
+	inputToken, inputOK := inputTokenValue.(int64)
+	outputToken, outputOK := outputTokenValue.(int64)
+	if !inputOK || !outputOK {
+		return 0, false
+	}
+	return inputToken + outputToken, true
 }
 
 func deniedNoKeyAuthData() types.Action {
