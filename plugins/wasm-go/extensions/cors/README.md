@@ -15,6 +15,10 @@ description: 跨域资源共享插件配置参考
 
 ## 版本说明
 
+### 2.0.2
+
+相比 `2.0.1`，新增 `allow_private_network`，支持 Chrome Private Network Access（PNA）预检头 `Access-Control-Allow-Private-Network`。合法预检仍由插件本地返回 `204`，可在网关侧完整接管跨域，无需后端参与。
+
 ### 2.0.1
 
 相比 `2.0.0`，本版本对齐浏览器 CORS 语义，并将插件执行优先级调整为 `2000`。
@@ -40,6 +44,7 @@ description: 跨域资源共享插件配置参考
 | allow_headers         | array of string | 选填     | DNT,X-CustomHeader,Keep-Alive,User-Agent,X-Requested-With，<br/>If-Modified-Since,Cache-Control,Content-Type,Authorization | 允许跨域访问时请求方携带哪些非 CORS 规范以外的 Header。可以使用 * 来表示允许任意 Header；预检响应会回显规范化后的 `Access-Control-Request-Headers`，没有请求头时不返回 `Access-Control-Allow-Headers`。                                      |
 | expose_headers        | array of string | 选填     | -                                                                                                                          | 允许跨域访问时响应方携带哪些非 CORS 规范以外的 Header。可以使用 *；但当请求携带凭据时，浏览器会把 `Access-Control-Expose-Headers: *` 当作字面量 Header 名称，而不是暴露所有 Header。                                                          |
 | allow_credentials     | bool            | 选填     | false                                                                                                                      | 是否允许跨域访问的请求方携带凭据（如 Cookie 等）。根据 CORS 规范，如果设置该选项为 true，在 allow_origins 不能使用 *， 替换成使用 allow_origin_patterns *                                                                                    |
+| allow_private_network | bool            | 选填     | false                                                                                                                      | 是否允许 Private Network Access（公网站点访问私网/内网 API）。开启后，预检请求带 `Access-Control-Request-Private-Network: true` 时，插件直接返回 `Access-Control-Allow-Private-Network: true`；实际 CORS 响应在开启时也会带上该头。用于替代仅在上游响应生效的 `response-header-control-add`。 |
 | max_age               | number          | 选填     | 86400秒                                                                                                                    | 浏览器缓存 CORS 结果的最大时间，单位为秒。<br/>在这个时间范围内，浏览器会复用上一次的检查结果                                                                                                                                                |
 
 > 注意

@@ -15,6 +15,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"testing"
 
@@ -24,6 +25,27 @@ import (
 	"github.com/higress-group/wasm-go/pkg/test"
 	"github.com/stretchr/testify/require"
 )
+
+var privateNetworkCorsConfig = func() json.RawMessage {
+	data, _ := json.Marshal(map[string]interface{}{
+		"allow_origins": []string{
+			"https://cmdm.yuexiuproperty.cn",
+		},
+		"allow_methods": []string{
+			"GET", "PUT", "POST", "HEAD", "DELETE", "PATCH", "OPTIONS",
+		},
+		"allow_headers": []string{
+			"*",
+		},
+		"expose_headers": []string{
+			"*",
+		},
+		"allow_credentials":     true,
+		"allow_private_network": true,
+		"max_age":               86400,
+	})
+	return data
+}()
 
 func TestIssue1743InvalidActualCorsRequestContinuesUpstream(t *testing.T) {
 	test.RunTest(t, func(t *testing.T) {
@@ -115,6 +137,62 @@ func TestIssue1743ValidPreflightReturnsNoContentWithCorsHeaders(t *testing.T) {
 		require.True(t, test.HasHeaderWithValue(localResponse.Headers, config.HeaderAccessControlAllowHeaders, "Content-Type,Authorization"))
 		require.True(t, test.HasHeaderWithValue(localResponse.Headers, config.HeaderAccessControlExposeHeaders, "X-Custom-Header"))
 		require.True(t, test.HasHeaderWithValue(localResponse.Headers, config.HeaderAccessControlMaxAge, "3600"))
+		require.False(t, test.HasHeader(localResponse.Headers, config.HeaderAccessControlAllowPrivateNetwork))
+
+		host.CompleteHttp()
+	})
+}
+
+func TestAllowPrivateNetworkPreflightReturnsPNAHeader(t *testing.T) {
+	test.RunTest(t, func(t *testing.T) {
+		host, status := test.NewTestHost(privateNetworkCorsConfig)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+
+		action := host.CallOnHttpRequestHeaders([][2]string{
+			{":scheme", "http"},
+			{":authority", "cmdm-api.yuexiuproperty.cn"},
+			{":path", "/admin-api/"},
+			{":method", "OPTIONS"},
+			{"origin", "https://cmdm.yuexiuproperty.cn"},
+			{"access-control-request-method", "POST"},
+			{"access-control-request-headers", "content-type,authorization"},
+			{"access-control-request-private-network", "true"},
+		})
+
+		require.Equal(t, types.ActionPause, action)
+		localResponse := host.GetLocalResponse()
+		require.NotNil(t, localResponse)
+		require.Equal(t, uint32(http.StatusNoContent), localResponse.StatusCode)
+		require.Equal(t, "cors.preflight", localResponse.StatusCodeDetail)
+		require.True(t, test.HasHeaderWithValue(localResponse.Headers, config.HeaderAccessControlAllowOrigin, "https://cmdm.yuexiuproperty.cn"))
+		require.True(t, test.HasHeaderWithValue(localResponse.Headers, config.HeaderAccessControlAllowCredentials, "true"))
+		require.True(t, test.HasHeaderWithValue(localResponse.Headers, config.HeaderAccessControlAllowPrivateNetwork, "true"))
+
+		host.CompleteHttp()
+	})
+}
+
+func TestAllowPrivateNetworkPreflightWithoutRequestHeaderOmitsPNAHeader(t *testing.T) {
+	test.RunTest(t, func(t *testing.T) {
+		host, status := test.NewTestHost(privateNetworkCorsConfig)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+
+		action := host.CallOnHttpRequestHeaders([][2]string{
+			{":scheme", "http"},
+			{":authority", "cmdm-api.yuexiuproperty.cn"},
+			{":path", "/admin-api/"},
+			{":method", "OPTIONS"},
+			{"origin", "https://cmdm.yuexiuproperty.cn"},
+			{"access-control-request-method", "POST"},
+		})
+
+		require.Equal(t, types.ActionPause, action)
+		localResponse := host.GetLocalResponse()
+		require.NotNil(t, localResponse)
+		require.True(t, test.HasHeaderWithValue(localResponse.Headers, config.HeaderAccessControlAllowOrigin, "https://cmdm.yuexiuproperty.cn"))
+		require.False(t, test.HasHeader(localResponse.Headers, config.HeaderAccessControlAllowPrivateNetwork))
 
 		host.CompleteHttp()
 	})

@@ -1,0 +1,45 @@
+# Deploy wasm cors (with Private Network Access) for cmdm-api route.
+# Requires image built from this tree (VERSION 2.0.2-alpha+ with allow_private_network).
+# Also disable native Ingress CORS annotations on cloud-data-admin-api to avoid
+# Envoy CORS short-circuiting OPTIONS before the wasm plugin.
+---
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: cors-cmdm-api
+  namespace: higress-system
+  labels:
+    higress.io/wasm-plugin-name: cors
+    higress.io/resource-definer: higress
+  annotations:
+    higress.io/wasm-plugin-title: CORS
+    higress.io/wasm-plugin-description: Cross-Origin Resource Sharing with Private Network Access
+spec:
+  url: oci://yxdc-registry.cn-shenzhen.cr.aliyuncs.com/dockerhub/higress-wasm/cors:2.0.2-alpha
+  imagePullPolicy: Always
+  phase: AUTHN
+  priority: 2000
+  failStrategy: FAIL_OPEN
+  defaultConfigDisable: true
+  matchRules:
+    - configDisable: false
+      ingress:
+        - cloud-data-admin-api
+      config:
+        allow_origins:
+          - https://cmdm.yuexiuproperty.cn
+        allow_methods:
+          - GET
+          - PUT
+          - POST
+          - HEAD
+          - DELETE
+          - PATCH
+          - OPTIONS
+        allow_headers:
+          - "*"
+        expose_headers:
+          - "*"
+        allow_credentials: true
+        allow_private_network: true
+        max_age: 86400

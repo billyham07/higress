@@ -12,6 +12,10 @@ Plugin execution priority: `2000`
 
 ## Release Notes
 
+### 2.0.2
+
+Compared with `2.0.1`, adds `allow_private_network` for Chrome Private Network Access (PNA). When enabled, preflights that send `Access-Control-Request-Private-Network: true` get `Access-Control-Allow-Private-Network: true` on the gateway-local `204` response.
+
 ### 2.0.1
 
 Compared with `2.0.0`, this version aligns the plugin behavior with browser CORS semantics and changes the plugin execution priority to `2000`.
@@ -36,6 +40,7 @@ Changes and upgrade notes:
 | allow_headers         | array of string  | Optional | DNT,X-CustomHeader,Keep-Alive,User-Agent,X-Requested-With,<br/>If-Modified-Since,Cache-Control,Content-Type,Authorization | Allowed Headers for the requester to carry that are not part of CORS specifications during cross-origin access. `*` can be used to indicate any Header is allowed; preflight responses echo normalized `Access-Control-Request-Headers`, and omit `Access-Control-Allow-Headers` when no request headers were requested. |
 | expose_headers        | array of string  | Optional | -                                                                                                                           | Allowed Headers for the responder to expose during cross-origin access. `*` can be used, but for credentialed requests browsers treat `Access-Control-Expose-Headers: *` as a literal header name instead of exposing all headers.                |
 | allow_credentials     | bool             | Optional | false                                                                                                                       | Whether to allow the requester to carry credentials (e.g. Cookies) during cross-origin access. According to CORS specifications, if this option is set to true, * cannot be used for allow_origins, replace it with allow_origin_patterns.  |
+| allow_private_network | bool             | Optional | false                                                                                                                       | Allow Private Network Access (public site calling a private/intranet API). When true, preflights with `Access-Control-Request-Private-Network: true` receive `Access-Control-Allow-Private-Network: true`.                                 |
 | max_age               | number           | Optional | 86400 seconds                                                                                                              | Maximum time for browsers to cache CORS results, in seconds. <br/>Within this time frame, browsers will reuse the previous inspection results.                                                                                                 |
 > Note
 > * allow_credentials is a very sensitive option, please enable it with caution. Once enabled, allow_credentials and allow_origins cannot both be *, if both are set, the allow_origins value of "*" takes effect.

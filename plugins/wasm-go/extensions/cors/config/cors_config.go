@@ -39,15 +39,17 @@ const (
 	HeaderOrigin      = "Origin"
 	HttpMethodOptions = "OPTIONS"
 
-	HeaderAccessControlAllowOrigin      = "Access-Control-Allow-Origin"
-	HeaderAccessControlAllowMethods     = "Access-Control-Allow-Methods"
-	HeaderAccessControlAllowHeaders     = "Access-Control-Allow-Headers"
-	HeaderAccessControlAllowCredentials = "Access-Control-Allow-Credentials"
-	HeaderAccessControlExposeHeaders    = "Access-Control-Expose-Headers"
-	HeaderAccessControlMaxAge           = "Access-Control-Max-Age"
+	HeaderAccessControlAllowOrigin         = "Access-Control-Allow-Origin"
+	HeaderAccessControlAllowMethods        = "Access-Control-Allow-Methods"
+	HeaderAccessControlAllowHeaders        = "Access-Control-Allow-Headers"
+	HeaderAccessControlAllowCredentials    = "Access-Control-Allow-Credentials"
+	HeaderAccessControlExposeHeaders       = "Access-Control-Expose-Headers"
+	HeaderAccessControlMaxAge              = "Access-Control-Max-Age"
+	HeaderAccessControlAllowPrivateNetwork = "Access-Control-Allow-Private-Network"
 
-	HeaderControlRequestMethod  = "Access-Control-Request-Method"
-	HeaderControlRequestHeaders = "Access-Control-Request-Headers"
+	HeaderControlRequestMethod         = "Access-Control-Request-Method"
+	HeaderControlRequestHeaders        = "Access-Control-Request-Headers"
+	HeaderControlRequestPrivateNetwork = "Access-Control-Request-Private-Network"
 
 	HttpContextKey = "CORS"
 )
@@ -124,26 +126,35 @@ type CorsConfig struct {
 	// By default, it is not set (i.e. user credentials are not supported).
 	allowCredentials bool
 
+	// allowPrivateNetwork Whether to permit Private Network Access (PNA) preflights
+	// from a more-public origin to a more-private target (e.g. public site -> intranet API).
+	// When true, valid CORS responses include Access-Control-Allow-Private-Network: true
+	// if the request carries Access-Control-Request-Private-Network: true (preflight),
+	// or always on non-preflight CORS responses so subsequent actual requests stay valid.
+	// By default, it is false.
+	allowPrivateNetwork bool
+
 	// maxAge Configure how long, in seconds, the response from a pre-flight request can be cached by clients.
 	// By default, it is set to 86400 seconds.
 	maxAge int
 }
 
 type HttpCorsContext struct {
-	IsValid          bool
-	ValidReason      string
-	IsPreFlight      bool
-	IsCorsRequest    bool
-	AllowOrigin      string
-	AllowMethods     string
-	AllowHeaders     string
-	ExposeHeaders    string
-	AllowCredentials bool
-	MaxAge           int
+	IsValid             bool
+	ValidReason         string
+	IsPreFlight         bool
+	IsCorsRequest       bool
+	AllowOrigin         string
+	AllowMethods        string
+	AllowHeaders        string
+	ExposeHeaders       string
+	AllowCredentials    bool
+	AllowPrivateNetwork bool
+	MaxAge              int
 }
 
 func (c *CorsConfig) GetVersion() string {
-	return "2.0.1"
+	return "2.0.2"
 }
 
 func (c *CorsConfig) FillDefaultValues() {
@@ -230,6 +241,10 @@ func (c *CorsConfig) SetAllowCredentials(allowCredentials bool) error {
 	return nil
 }
 
+func (c *CorsConfig) SetAllowPrivateNetwork(allowPrivateNetwork bool) {
+	c.allowPrivateNetwork = allowPrivateNetwork
+}
+
 func (c *CorsConfig) SetMaxAge(maxAge int) {
 	if maxAge <= 0 {
 		c.maxAge = defaultMaxAge
@@ -250,6 +265,7 @@ func (c *CorsConfig) Process(scheme string, host string, method string, headers 
 	origin := ""
 	controlRequestMethod := ""
 	controlRequestHeaders := ""
+	controlRequestPrivateNetwork := false
 	for _, header := range headers {
 		key := header[0]
 		// Get origin
@@ -262,6 +278,9 @@ func (c *CorsConfig) Process(scheme string, host string, method string, headers 
 		}
 		if strings.ToLower(key) == strings.ToLower(HeaderControlRequestHeaders) {
 			controlRequestHeaders = strings.TrimSpace(header[1])
+		}
+		if strings.ToLower(key) == strings.ToLower(HeaderControlRequestPrivateNetwork) {
+			controlRequestPrivateNetwork = strings.EqualFold(strings.TrimSpace(header[1]), "true")
 		}
 	}
 
@@ -324,6 +343,15 @@ func (c *CorsConfig) Process(scheme string, host string, method string, headers 
 		httpCorsContext.ExposeHeaders = strings.Join(c.exposeHeaders, ",")
 	}
 	httpCorsContext.AllowCredentials = c.allowCredentials
+	// PNA: echo Allow-Private-Network only when configured and (preflight requested it,
+	// or this is a non-preflight CORS response for an already-approved private target).
+	if c.allowPrivateNetwork {
+		if isPreFlight {
+			httpCorsContext.AllowPrivateNetwork = controlRequestPrivateNetwork
+		} else {
+			httpCorsContext.AllowPrivateNetwork = true
+		}
+	}
 
 	return httpCorsContext, nil
 }
