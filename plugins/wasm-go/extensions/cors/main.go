@@ -71,6 +71,10 @@ func parseConfig(json gjson.Result, corsConfig *config.CorsConfig, log log.Log) 
 	if err := corsConfig.SetAllowCredentials(allowCredentials); err != nil {
 		log.Warnf("failed to set AllowCredentials error: %v", err)
 	}
+	// allow_private_network defaults to false when omitted (gjson Bool() is false).
+	if json.Get("allow_private_network").Exists() {
+		corsConfig.SetAllowPrivateNetwork(json.Get("allow_private_network").Bool())
+	}
 	maxAge := json.Get("max_age").Int()
 	corsConfig.SetMaxAge(int(maxAge))
 
@@ -121,13 +125,14 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, corsConfig config.CorsConfig
 	log.Debug("onHttpResponseHeaders()")
 	// Remove trace header if existed
 	proxywasm.RemoveHttpResponseHeader(config.HeaderPluginTrace)
-	// Remove upstream cors response headers if existed
+	// Remove upstream cors response headers if existed (gateway owns CORS)
 	proxywasm.RemoveHttpResponseHeader(config.HeaderAccessControlAllowOrigin)
 	proxywasm.RemoveHttpResponseHeader(config.HeaderAccessControlAllowMethods)
 	proxywasm.RemoveHttpResponseHeader(config.HeaderAccessControlAllowHeaders)
 	proxywasm.RemoveHttpResponseHeader(config.HeaderAccessControlExposeHeaders)
 	proxywasm.RemoveHttpResponseHeader(config.HeaderAccessControlAllowCredentials)
 	proxywasm.RemoveHttpResponseHeader(config.HeaderAccessControlMaxAge)
+	proxywasm.RemoveHttpResponseHeader(config.HeaderAccessControlAllowPrivateNetwork)
 	// Add debug header
 	proxywasm.AddHttpResponseHeader(config.HeaderPluginDebug, corsConfig.GetVersion())
 
@@ -169,6 +174,9 @@ func buildCorsHeaders(httpCorsContext config.HttpCorsContext) [][2]string {
 	}
 	if httpCorsContext.AllowCredentials {
 		headers = append(headers, [2]string{config.HeaderAccessControlAllowCredentials, "true"})
+	}
+	if httpCorsContext.AllowPrivateNetwork {
+		headers = append(headers, [2]string{config.HeaderAccessControlAllowPrivateNetwork, "true"})
 	}
 	if httpCorsContext.MaxAge > 0 {
 		headers = append(headers, [2]string{config.HeaderAccessControlMaxAge, fmt.Sprintf("%d", httpCorsContext.MaxAge)})
