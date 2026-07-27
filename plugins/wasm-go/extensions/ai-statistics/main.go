@@ -926,12 +926,17 @@ func isSemanticStreamEnd(ctx wrapper.HttpContext, data []byte) bool {
 	}
 	ctx.SetContext(StatisticsTerminalTail, tail)
 
-	if bytes.Contains(probe, []byte("[DONE]")) ||
-		bytes.Contains(probe, []byte(`"response.completed"`)) ||
-		bytes.Contains(probe, []byte(`"response.incomplete"`)) ||
-		bytes.Contains(probe, []byte(`"response.failed"`)) ||
-		bytes.Contains(probe, []byte(`"message_stop"`)) {
+	if bytes.Contains(probe, []byte("[DONE]")) || bytes.Contains(probe, []byte("message_stop")) {
 		return true
+	}
+	if bytes.Contains(probe, []byte("response.failed")) {
+		return true
+	}
+	if bytes.Contains(probe, []byte("response.completed")) || bytes.Contains(probe, []byte("response.incomplete")) {
+		// The SSE event line can arrive in a separate body callback before its
+		// data payload. Wait until tokenusage has parsed the payload, otherwise
+		// finalizing on the event name alone can record zero tokens.
+		return ctx.GetUserAttribute(tokenusage.CtxKeyTotalToken) != nil
 	}
 
 	// OpenAI-compatible providers normally put final usage in an empty-choices

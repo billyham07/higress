@@ -326,9 +326,11 @@ func TestSemanticStreamEndChargesExactlyOnce(t *testing.T) {
 				name:        "openai responses incomplete without transport eof",
 				path:        "/v1/responses",
 				requestBody: []byte(`{"model":"gpt-5","stream":true}`),
-				terminalChunk: []byte(`event: response.incomplete
-data: {"type":"response.incomplete","response":{"id":"resp_1","model":"gpt-5","usage":{"input_tokens":9,"output_tokens":3,"total_tokens":12}}}`),
-				wantTotal: "12",
+				chunks: [][]byte{
+					[]byte("event: response.incomplete\n"),
+				},
+				terminalChunk: []byte(`data: {"response":{"id":"resp_1","model":"gpt-5","usage":{"input_tokens":9,"output_tokens":3,"total_tokens":12}}}`),
+				wantTotal:     "12",
 			},
 			{
 				name:        "anthropic final delta includes cache tokens",
