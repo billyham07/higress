@@ -58,6 +58,7 @@ const (
 	ClusterName                = "cluster"
 	APIName                    = "api"
 	ConsumerKey                = "x-mse-consumer"
+	ConsumerAttribute          = "consumer"
 	RequestPath                = "request_path"
 	SkipProcessing             = "skip_processing"
 
@@ -751,6 +752,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIStatisticsConfig, body 
 		}
 	}
 	ctx.SetContext(tokenusage.CtxKeyRequestModel, requestModel)
+	ctx.SetUserAttribute(tokenusage.CtxKeyModel, requestModel)
 	setSpanAttribute(ArmsRequestModel, requestModel)
 
 	// Set the number of conversation rounds (only if body is available)
@@ -781,6 +783,14 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIStatisticsConfig, body 
 }
 
 func onHttpResponseHeaders(ctx wrapper.HttpContext, config AIStatisticsConfig) types.Action {
+	// key-auth runs after ai-statistics in the request phase. Refresh identity
+	// here, after authentication has injected x-mse-consumer, so access logs do
+	// not retain the early missing/default consumer value. Also persist the
+	// requested model for error responses that never contain upstream usage.
+	refreshLateBoundLogAttributes(ctx)
+	debugLogAiLog(ctx)
+	_ = ctx.WriteUserAttributeToLogWithKey(wrapper.AILogKey)
+
 	contentType, _ := proxywasm.GetHttpResponseHeader("content-type")
 
 	if !isContentTypeEnabled(contentType, config.enableContentTypes) {
@@ -869,6 +879,7 @@ func onHttpStreamingBody(ctx wrapper.HttpContext, config AIStatisticsConfig, dat
 			}
 
 			// Write once
+			refreshLateBoundLogAttributes(ctx)
 			_ = ctx.WriteUserAttributeToLogWithKey(wrapper.AILogKey)
 		}
 	}
@@ -902,6 +913,7 @@ func finalizeStreamingMetrics(ctx wrapper.HttpContext, config AIStatisticsConfig
 	setAttributeBySource(ctx, config, ResponseStreamingBody, streamingBodyBuffer)
 
 	debugLogAiLog(ctx)
+	refreshLateBoundLogAttributes(ctx)
 	_ = ctx.WriteUserAttributeToLogWithKey(wrapper.AILogKey)
 
 	bodyForMetric := data
@@ -1004,6 +1016,30 @@ func enrichAnthropicStreamingUsage(ctx wrapper.HttpContext, data []byte, usage *
 	}
 }
 
+func refreshLateBoundLogAttributes(ctx wrapper.HttpContext) {
+	consumer, _ := proxywasm.GetHttpRequestHeader(ConsumerKey)
+	if consumer == "" {
+		consumer = ctx.GetStringContext(ConsumerKey, "")
+	}
+	if consumer == "" {
+		consumer = ctx.GetStringContext(ConsumerAttribute, "")
+	}
+	if consumer == "" {
+		consumer = "unknown"
+	}
+	ctx.SetContext(ConsumerKey, consumer)
+	ctx.SetUserAttribute(ConsumerAttribute, consumer)
+
+	model, _ := ctx.GetUserAttribute(tokenusage.CtxKeyModel).(string)
+	if model == "" || model == tokenusage.ModelEmpty || model == tokenusage.ModelUnknown || model == "UNKNOWN" {
+		requestModel := ctx.GetStringContext(tokenusage.CtxKeyRequestModel, "UNKNOWN")
+		if requestModel == "" {
+			requestModel = "UNKNOWN"
+		}
+		ctx.SetUserAttribute(tokenusage.CtxKeyModel, requestModel)
+	}
+}
+
 func onHttpResponseBody(ctx wrapper.HttpContext, config AIStatisticsConfig, body []byte) types.Action {
 	// Check if processing should be skipped
 	if ctx.GetBoolContext(SkipProcessing, false) {
@@ -1050,6 +1086,7 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config AIStatisticsConfig, body
 
 	// Write log
 	debugLogAiLog(ctx)
+	refreshLateBoundLogAttributes(ctx)
 	_ = ctx.WriteUserAttributeToLogWithKey(wrapper.AILogKey)
 
 	// Write metrics
