@@ -335,12 +335,19 @@ func isSemanticStreamEnd(ctx wrapper.HttpContext, data []byte) bool {
 	}
 	ctx.SetContext(quotaTerminalTailKey, tail)
 
-	if bytes.Contains(probe, []byte("[DONE]")) ||
-		bytes.Contains(probe, []byte(`"response.completed"`)) ||
-		bytes.Contains(probe, []byte(`"response.incomplete"`)) ||
-		bytes.Contains(probe, []byte(`"response.failed"`)) ||
-		bytes.Contains(probe, []byte(`"message_stop"`)) {
+	if bytes.Contains(probe, []byte("[DONE]")) || bytes.Contains(probe, []byte("message_stop")) {
 		return true
+	}
+	if bytes.Contains(probe, []byte("response.completed")) ||
+		bytes.Contains(probe, []byte("response.incomplete")) ||
+		bytes.Contains(probe, []byte("response.failed")) {
+		_, ok := getQuotaToken(
+			ctx.GetContext(tokenusage.CtxKeyTotalToken),
+			ctx.GetContext(tokenusage.CtxKeyInputToken),
+			ctx.GetContext(tokenusage.CtxKeyOutputToken),
+			ctx.GetContext(tokenusage.CtxKeyInputTokenDetails),
+		)
+		return ok
 	}
 
 	usage := wrapper.GetValueFromBody(data, []string{"usage"})
