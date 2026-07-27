@@ -21,6 +21,7 @@ import (
 
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
 	"github.com/higress-group/wasm-go/pkg/test"
+	"github.com/higress-group/wasm-go/pkg/tokenusage"
 	"github.com/higress-group/wasm-go/pkg/wrapper"
 	"github.com/stretchr/testify/require"
 )
@@ -504,6 +505,33 @@ func getAILogAttributes(t *testing.T, host test.TestHost) map[string]interface{}
 	var attrs map[string]interface{}
 	require.NoError(t, json.Unmarshal([]byte(wrapper.UnmarshalStr(`"`+string(raw)+`"`)), &attrs))
 	return attrs
+}
+
+func TestConsumerAndRequestModelLoggingOnErrorResponse(t *testing.T) {
+	test.RunTest(t, func(t *testing.T) {
+		host, status := test.NewTestHost(basicConfig)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+
+		host.CallOnHttpRequestHeaders([][2]string{
+			{":authority", "example.com"},
+			{":path", "/v1/chat/completions"},
+			{":method", "POST"},
+			{"x-mse-consumer", "late-consumer"},
+		})
+		host.CallOnHttpRequestBody([]byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hello"}]}`))
+
+		// Simulate an upstream error without usage. The response-header refresh
+		// must still persist both the authenticated consumer and requested model.
+		host.CallOnHttpResponseHeaders([][2]string{
+			{":status", "429"},
+			{"content-type", "text/plain"},
+		})
+
+		attrs := getAILogAttributes(t, host)
+		require.Equal(t, "late-consumer", attrs[ConsumerAttribute])
+		require.Equal(t, "glm-5.2", attrs[tokenusage.CtxKeyModel])
+	})
 }
 
 func TestOnHttpStreamingBody(t *testing.T) {
