@@ -79,14 +79,17 @@ const (
 	ResponseBody          = "response_body"
 
 	// Inner metric & log attributes
-	LLMFirstTokenDuration  = "llm_first_token_duration"
-	LLMServiceDuration     = "llm_service_duration"
-	LLMDurationCount       = "llm_duration_count"
-	LLMStreamDurationCount = "llm_stream_duration_count"
-	LLMFailureCount        = "llm_failure_count"
-	ResponseType           = "response_type"
-	ChatID                 = "chat_id"
-	ChatRound              = "chat_round"
+	LLMFirstTokenDuration   = "llm_first_token_duration"
+	LLMServiceDuration      = "llm_service_duration"
+	LLMDurationCount        = "llm_duration_count"
+	LLMStreamDurationCount  = "llm_stream_duration_count"
+	LLMFailureCount         = "llm_failure_count"
+	CachedToken             = "cached_token"
+	CacheCreationInputToken = "cache_creation_input_token"
+	ReasoningToken          = "reasoning_token"
+	ResponseType            = "response_type"
+	ChatID                  = "chat_id"
+	ChatRound               = "chat_round"
 
 	// Inner span attributes
 	ArmsSpanKind     = "gen_ai.span.kind"
@@ -1166,8 +1169,10 @@ func getBuiltinAttributeFallback(ctx wrapper.HttpContext, config AIStatisticsCon
 		// Extract reasoning_tokens from output_token_details (only available after response)
 		if source == ResponseBody || source == ResponseStreamingBody {
 			if outputTokenDetails, ok := ctx.GetContext(tokenusage.CtxKeyOutputTokenDetails).(map[string]int64); ok {
-				if reasoningTokens, exists := outputTokenDetails["reasoning_tokens"]; exists {
-					return reasoningTokens
+				for _, key := range []string{"reasoning_tokens", "thoughts_token_count"} {
+					if reasoningTokens, exists := outputTokenDetails[key]; exists {
+						return reasoningTokens
+					}
 				}
 			}
 		}
@@ -1175,8 +1180,10 @@ func getBuiltinAttributeFallback(ctx wrapper.HttpContext, config AIStatisticsCon
 		// Extract cached_tokens from input_token_details (only available after response)
 		if source == ResponseBody || source == ResponseStreamingBody {
 			if inputTokenDetails, ok := ctx.GetContext(tokenusage.CtxKeyInputTokenDetails).(map[string]int64); ok {
-				if cachedTokens, exists := inputTokenDetails["cached_tokens"]; exists {
-					return cachedTokens
+				for _, key := range []string{"cached_tokens", "cache_read_input_tokens", "cached_content_token_count"} {
+					if cachedTokens, exists := inputTokenDetails[key]; exists {
+						return cachedTokens
+					}
 				}
 			}
 		}
@@ -1475,6 +1482,22 @@ func writeMetric(ctx wrapper.HttpContext, config AIStatisticsConfig, body []byte
 		log.Info("TotalToken type assert failed, skip metric record")
 	}
 
+	// Token detail metrics are recorded independently because cached and reasoning
+	// tokens are subsets of input/output tokens for OpenAI-compatible protocols.
+	// They therefore cannot be derived from total - input - output.
+	if cachedToken, ok := getTokenDetailMetric(ctx, tokenusage.CtxKeyInputTokenDetails,
+		"cached_tokens", "cache_read_input_tokens", "cached_content_token_count"); ok {
+		config.incrementCounter(generateMetricName(route, cluster, model, consumer, CachedToken), cachedToken)
+	}
+	if cacheCreationToken, ok := getTokenDetailMetric(ctx, tokenusage.CtxKeyInputTokenDetails,
+		"cache_creation_input_tokens"); ok {
+		config.incrementCounter(generateMetricName(route, cluster, model, consumer, CacheCreationInputToken), cacheCreationToken)
+	}
+	if reasoningToken, ok := getTokenDetailMetric(ctx, tokenusage.CtxKeyOutputTokenDetails,
+		"reasoning_tokens", "thoughts_token_count"); ok {
+		config.incrementCounter(generateMetricName(route, cluster, model, consumer, ReasoningToken), reasoningToken)
+	}
+
 	// Generate duration metrics
 	var llmFirstTokenDuration, llmServiceDuration uint64
 	// Is stream response
@@ -1496,6 +1519,21 @@ func writeMetric(ctx wrapper.HttpContext, config AIStatisticsConfig, body []byte
 		config.incrementCounter(generateMetricName(route, cluster, model, consumer, LLMServiceDuration), llmServiceDuration)
 		config.incrementCounter(generateMetricName(route, cluster, model, consumer, LLMDurationCount), 1)
 	}
+}
+
+func getTokenDetailMetric(ctx wrapper.HttpContext, contextKey string, keys ...string) (uint64, bool) {
+	var details map[string]int64
+	if value, ok := ctx.GetContext(contextKey).(map[string]int64); ok {
+		details = value
+	} else if value, ok := ctx.GetUserAttribute(contextKey).(map[string]int64); ok {
+		details = value
+	}
+	for _, key := range keys {
+		if value, exists := details[key]; exists && value >= 0 {
+			return uint64(value), true
+		}
+	}
+	return 0, false
 }
 
 func convertToUInt(val interface{}) (uint64, bool) {

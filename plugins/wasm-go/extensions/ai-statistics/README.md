@@ -122,6 +122,15 @@ route_upstream_model_consumer_metric_input_token{ai_route="ai-route-aliyun.inter
 # counter 类型，输出 token 数量的累加值
 route_upstream_model_consumer_metric_output_token{ai_route="ai-route-aliyun.internal",ai_cluster="outbound|443||llm-aliyun.internal.dns",ai_model="qwen-turbo",ai_consumer="none"} 507
 
+# counter 类型，缓存读取 token 数量的累加值
+route_upstream_model_consumer_metric_cached_token{ai_route="ai-route-aliyun.internal",ai_cluster="outbound|443||llm-aliyun.internal.dns",ai_model="qwen-turbo",ai_consumer="none"} 128
+
+# counter 类型，缓存创建 token 数量的累加值（Anthropic 等协议）
+route_upstream_model_consumer_metric_cache_creation_input_token{ai_route="ai-route-aliyun.internal",ai_cluster="outbound|443||llm-aliyun.internal.dns",ai_model="qwen-turbo",ai_consumer="none"} 64
+
+# counter 类型，推理 token 数量的累加值
+route_upstream_model_consumer_metric_reasoning_token{ai_route="ai-route-aliyun.internal",ai_cluster="outbound|443||llm-aliyun.internal.dns",ai_model="qwen-turbo",ai_consumer="none"} 256
+
 # counter 类型，流式请求和非流式请求消耗总时间的累加值
 route_upstream_model_consumer_metric_llm_service_duration{ai_route="ai-route-aliyun.internal",ai_cluster="outbound|443||llm-aliyun.internal.dns",ai_model="qwen-turbo",ai_consumer="none"} 6470
 
