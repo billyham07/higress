@@ -961,6 +961,11 @@ func TestMetrics(t *testing.T) {
 			cacheCreationValue, err := host.GetCounterMetric(cacheCreationMetric)
 			require.NoError(t, err)
 			require.Equal(t, uint64(15), cacheCreationValue)
+
+			cacheDetailInTotalMetric := "route.api-v1.upstream.cluster-1.model.qwen3.8-max-preview.consumer.anthropic-user.metric.cache_detail_in_total_token"
+			cacheDetailInTotalValue, err := host.GetCounterMetric(cacheDetailInTotalMetric)
+			require.NoError(t, err)
+			require.Equal(t, uint64(95), cacheDetailInTotalValue)
 		})
 	})
 }

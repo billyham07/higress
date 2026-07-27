@@ -128,6 +128,9 @@ route_upstream_model_consumer_metric_cached_token{ai_route="ai-route-aliyun.inte
 # counter 类型，缓存创建 token 数量的累加值（Anthropic 等协议）
 route_upstream_model_consumer_metric_cache_creation_input_token{ai_route="ai-route-aliyun.internal",ai_cluster="outbound|443||llm-aliyun.internal.dns",ai_model="qwen-turbo",ai_consumer="none"} 64
 
+# counter 类型，已包含在 total-input-output 反推值中的缓存明细 token，用于新旧指标兼容去重
+route_upstream_model_consumer_metric_cache_detail_in_total_token{ai_route="ai-route-aliyun.internal",ai_cluster="outbound|443||llm-aliyun.internal.dns",ai_model="qwen-turbo",ai_consumer="none"} 192
+
 # counter 类型，推理 token 数量的累加值
 route_upstream_model_consumer_metric_reasoning_token{ai_route="ai-route-aliyun.internal",ai_cluster="outbound|443||llm-aliyun.internal.dns",ai_model="qwen-turbo",ai_consumer="none"} 256
 
