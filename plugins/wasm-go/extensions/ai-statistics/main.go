@@ -86,6 +86,7 @@ const (
 	LLMFailureCount         = "llm_failure_count"
 	CachedToken             = "cached_token"
 	CacheCreationInputToken = "cache_creation_input_token"
+	CacheDetailInTotalToken = "cache_detail_in_total_token"
 	ReasoningToken          = "reasoning_token"
 	ResponseType            = "response_type"
 	ChatID                  = "chat_id"
@@ -1364,10 +1365,10 @@ func setSpanAttribute(key string, value interface{}) {
 
 // isErrorResponse checks whether the LLM response indicates an error.
 // Detects errors by:
-// 1. Response body contains non-null "error" field at root level (OpenAI/Anthropic format).
-//    Handles both raw JSON and SSE "data: " prefixed chunks, including multi-event
-//    streaming buffers.
-// 2. HTTP status code >= 400 as fallback when body is empty.
+//  1. Response body contains non-null "error" field at root level (OpenAI/Anthropic format).
+//     Handles both raw JSON and SSE "data: " prefixed chunks, including multi-event
+//     streaming buffers.
+//  2. HTTP status code >= 400 as fallback when body is empty.
 //
 // Note: some providers (e.g. Anthropic streaming responses) emit {"error":""}
 // even on success; an empty-string error is treated as not-an-error to avoid
@@ -1485,13 +1486,28 @@ func writeMetric(ctx wrapper.HttpContext, config AIStatisticsConfig, body []byte
 	// Token detail metrics are recorded independently because cached and reasoning
 	// tokens are subsets of input/output tokens for OpenAI-compatible protocols.
 	// They therefore cannot be derived from total - input - output.
-	if cachedToken, ok := getTokenDetailMetric(ctx, tokenusage.CtxKeyInputTokenDetails,
-		"cached_tokens", "cache_read_input_tokens", "cached_content_token_count"); ok {
+	cachedToken, hasCachedToken := getTokenDetailMetric(ctx, tokenusage.CtxKeyInputTokenDetails,
+		"cached_tokens", "cache_read_input_tokens", "cached_content_token_count")
+	if hasCachedToken {
 		config.incrementCounter(generateMetricName(route, cluster, model, consumer, CachedToken), cachedToken)
 	}
-	if cacheCreationToken, ok := getTokenDetailMetric(ctx, tokenusage.CtxKeyInputTokenDetails,
-		"cache_creation_input_tokens"); ok {
+	cacheCreationToken, hasCacheCreationToken := getTokenDetailMetric(ctx, tokenusage.CtxKeyInputTokenDetails,
+		"cache_creation_input_tokens")
+	if hasCacheCreationToken {
 		config.incrementCounter(generateMetricName(route, cluster, model, consumer, CacheCreationInputToken), cacheCreationToken)
+	}
+	if hasCachedToken || hasCacheCreationToken {
+		inputToken, inputOK := convertToUInt(ctx.GetUserAttribute(tokenusage.CtxKeyInputToken))
+		outputToken, outputOK := convertToUInt(ctx.GetUserAttribute(tokenusage.CtxKeyOutputToken))
+		totalToken, totalOK := convertToUInt(ctx.GetUserAttribute(tokenusage.CtxKeyTotalToken))
+		if inputOK && outputOK && totalOK && totalToken > inputToken+outputToken {
+			cacheDetailInTotal := totalToken - inputToken - outputToken
+			observedCacheDetails := cachedToken + cacheCreationToken
+			if cacheDetailInTotal > observedCacheDetails {
+				cacheDetailInTotal = observedCacheDetails
+			}
+			config.incrementCounter(generateMetricName(route, cluster, model, consumer, CacheDetailInTotalToken), cacheDetailInTotal)
+		}
 	}
 	if reasoningToken, ok := getTokenDetailMetric(ctx, tokenusage.CtxKeyOutputTokenDetails,
 		"reasoning_tokens", "thoughts_token_count"); ok {

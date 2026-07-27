@@ -125,6 +125,9 @@ route_upstream_model_consumer_metric_cached_token{ai_route="ai-route-aliyun.inte
 # counter, cumulative count of cache-creation tokens (Anthropic and compatible protocols)
 route_upstream_model_consumer_metric_cache_creation_input_token{ai_route="ai-route-aliyun.internal",ai_cluster="outbound|443||llm-aliyun.internal.dns",ai_model="qwen-turbo",ai_consumer="none"} 64
 
+# counter, observed cache-detail tokens already represented by total-input-output; used to deduplicate legacy inference
+route_upstream_model_consumer_metric_cache_detail_in_total_token{ai_route="ai-route-aliyun.internal",ai_cluster="outbound|443||llm-aliyun.internal.dns",ai_model="qwen-turbo",ai_consumer="none"} 192
+
 # counter, cumulative count of reasoning tokens
 route_upstream_model_consumer_metric_reasoning_token{ai_route="ai-route-aliyun.internal",ai_cluster="outbound|443||llm-aliyun.internal.dns",ai_model="qwen-turbo",ai_consumer="none"} 256
 
