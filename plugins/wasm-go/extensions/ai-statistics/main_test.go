@@ -1000,12 +1000,12 @@ func TestSemanticStreamEndWritesMetricsExactlyOnce(t *testing.T) {
 				wantCacheRead: 8,
 			},
 			{
-				name:        "openai responses completed without transport eof",
+				name:        "openai responses incomplete without transport eof",
 				path:        "/v1/responses",
 				model:       "gpt-5",
 				requestBody: []byte(`{"model":"gpt-5","stream":true}`),
-				terminalChunk: []byte(`event: response.completed
-data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5","usage":{"input_tokens":9,"output_tokens":3,"total_tokens":12,"input_tokens_details":{"cached_tokens":7}}}}`),
+				terminalChunk: []byte(`event: response.incomplete
+data: {"type":"response.incomplete","response":{"id":"resp_1","model":"gpt-5","usage":{"input_tokens":9,"output_tokens":3,"total_tokens":12,"input_tokens_details":{"cached_tokens":7}}}}`),
 				wantInput:     9,
 				wantOutput:    3,
 				wantTotal:     12,
