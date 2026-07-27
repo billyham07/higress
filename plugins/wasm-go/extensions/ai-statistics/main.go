@@ -49,6 +49,8 @@ const (
 	// Context consts
 	StatisticsRequestStartTime = "ai-statistics-request-start-time"
 	StatisticsFirstTokenTime   = "ai-statistics-first-token-time"
+	StatisticsMetricWritten    = "ai-statistics-metric-written"
+	StatisticsTerminalTail     = "ai-statistics-terminal-tail"
 	CtxGeneralAtrribute        = "attributes"
 	CtxLogAtrribute            = "logAttributes"
 	CtxStreamingBodyBuffer     = "streamingBodyBuffer"
@@ -849,7 +851,9 @@ func onHttpStreamingBody(ctx wrapper.HttpContext, config AIStatisticsConfig, dat
 
 	// Set information about this request
 	if !config.disableOpenaiUsage {
-		if usage := tokenusage.GetTokenUsage(ctx, data); usage.TotalToken > 0 {
+		usage := tokenusage.GetTokenUsage(ctx, data)
+		enrichAnthropicStreamingUsage(ctx, data, &usage)
+		if usage.TotalToken > 0 {
 			// Set span attributes for ARMS.
 			setSpanAttribute(ArmsTotalToken, usage.TotalToken)
 			setSpanAttribute(ArmsModelName, usage.Model)
@@ -868,33 +872,129 @@ func onHttpStreamingBody(ctx wrapper.HttpContext, config AIStatisticsConfig, dat
 			_ = ctx.WriteUserAttributeToLogWithKey(wrapper.AILogKey)
 		}
 	}
-	// If the end of the stream is reached, record metrics/logs/spans.
-	if endOfStream {
-		responseEndTime := time.Now().UnixMilli()
-		ctx.SetUserAttribute(LLMServiceDuration, responseEndTime-requestStartTime)
 
-		// Set user defined log & span attributes from streaming body.
-		// Always call setAttributeBySource even if shouldBufferStreamingBody is false,
-		// because token-related attributes are extracted from context (not buffered body).
-		var streamingBodyBuffer []byte
-		if config.shouldBufferStreamingBody {
-			streamingBodyBuffer, _ = ctx.GetContext(CtxStreamingBodyBuffer).([]byte)
-		}
-		setAttributeBySource(ctx, config, ResponseStreamingBody, streamingBodyBuffer)
-
-		// Write log
-		debugLogAiLog(ctx)
-		_ = ctx.WriteUserAttributeToLogWithKey(wrapper.AILogKey)
-
-		// Write metrics — prefer the accumulated buffer for error detection
-		// so that errors split across multiple SSE chunks are not missed.
-		bodyForMetric := data
-		if config.shouldBufferStreamingBody && len(streamingBodyBuffer) > 0 {
-			bodyForMetric = streamingBodyBuffer
-		}
-		writeMetric(ctx, config, bodyForMetric)
+	// A downstream client commonly stops reading immediately after a protocol-level
+	// terminal frame such as OpenAI's [DONE]. Envoy then reports a downstream reset
+	// and never invokes this callback with endOfStream=true. Finalize on either the
+	// semantic terminal frame or transport EOF, and guard it for exactly-once metrics.
+	if endOfStream || isSemanticStreamEnd(ctx, data) {
+		finalizeStreamingMetrics(ctx, config, data, requestStartTime)
 	}
 	return data
+}
+
+func finalizeStreamingMetrics(ctx wrapper.HttpContext, config AIStatisticsConfig, data []byte, requestStartTime int64) {
+	if ctx.GetBoolContext(StatisticsMetricWritten, false) {
+		return
+	}
+
+	responseEndTime := time.Now().UnixMilli()
+	ctx.SetUserAttribute(LLMServiceDuration, responseEndTime-requestStartTime)
+	normalizeAnthropicTotalToken(ctx)
+
+	// Set user defined log & span attributes from streaming body.
+	// Always call setAttributeBySource even if shouldBufferStreamingBody is false,
+	// because token-related attributes are extracted from context (not buffered body).
+	var streamingBodyBuffer []byte
+	if config.shouldBufferStreamingBody {
+		streamingBodyBuffer, _ = ctx.GetContext(CtxStreamingBodyBuffer).([]byte)
+	}
+	setAttributeBySource(ctx, config, ResponseStreamingBody, streamingBodyBuffer)
+
+	debugLogAiLog(ctx)
+	_ = ctx.WriteUserAttributeToLogWithKey(wrapper.AILogKey)
+
+	bodyForMetric := data
+	if config.shouldBufferStreamingBody && len(streamingBodyBuffer) > 0 {
+		bodyForMetric = streamingBodyBuffer
+	}
+	writeMetric(ctx, config, bodyForMetric)
+	ctx.SetContext(StatisticsMetricWritten, true)
+}
+
+func isSemanticStreamEnd(ctx wrapper.HttpContext, data []byte) bool {
+	tail, _ := ctx.GetContext(StatisticsTerminalTail).([]byte)
+	probe := make([]byte, 0, len(tail)+len(data))
+	probe = append(probe, tail...)
+	probe = append(probe, data...)
+
+	const terminalTailBytes = 512
+	if len(probe) > terminalTailBytes {
+		tail = append([]byte(nil), probe[len(probe)-terminalTailBytes:]...)
+	} else {
+		tail = append([]byte(nil), probe...)
+	}
+	ctx.SetContext(StatisticsTerminalTail, tail)
+
+	if bytes.Contains(probe, []byte("[DONE]")) ||
+		bytes.Contains(probe, []byte(`"response.completed"`)) ||
+		bytes.Contains(probe, []byte(`"message_stop"`)) {
+		return true
+	}
+
+	// OpenAI-compatible providers normally put final usage in an empty-choices
+	// frame before [DONE]. This also covers clients that disconnect before the
+	// sentinel is forwarded. Do not treat arbitrary usage-bearing content chunks
+	// as final because some providers emit intermediate usage snapshots.
+	usage := wrapper.GetValueFromBody(data, []string{"usage"})
+	choices := wrapper.GetValueFromBody(data, []string{"choices"})
+	if usage != nil && choices != nil && choices.IsArray() && len(choices.Array()) == 0 {
+		return true
+	}
+
+	// Anthropic's final message_delta carries cumulative output usage and a stop
+	// reason; message_start usage is intentionally not terminal.
+	return bytes.Contains(probe, []byte(`"message_delta"`)) &&
+		bytes.Contains(probe, []byte(`"stop_reason"`)) &&
+		bytes.Contains(probe, []byte(`"usage"`))
+}
+
+func normalizeAnthropicTotalToken(ctx wrapper.HttpContext) {
+	details, ok := ctx.GetContext(tokenusage.CtxKeyInputTokenDetails).(map[string]int64)
+	if !ok {
+		return
+	}
+	cacheRead := details[tokenusage.InputTokenDetailsKeyAnthropicMessagesUsageCacheReadInputTokens]
+	cacheCreation := details[tokenusage.InputTokenDetailsKeyAnthropicMessagesUsageCacheCreationInputTokens]
+	if cacheRead == 0 && cacheCreation == 0 {
+		return
+	}
+	inputToken, inputOK := ctx.GetUserAttribute(tokenusage.CtxKeyInputToken).(int64)
+	outputToken, outputOK := ctx.GetUserAttribute(tokenusage.CtxKeyOutputToken).(int64)
+	if !inputOK || !outputOK {
+		return
+	}
+	ctx.SetUserAttribute(tokenusage.CtxKeyTotalToken, inputToken+outputToken+cacheRead+cacheCreation)
+}
+
+func enrichAnthropicStreamingUsage(ctx wrapper.HttpContext, data []byte, usage *tokenusage.TokenUsage) {
+	if usage.InputTokenDetails == nil {
+		usage.InputTokenDetails = make(map[string]int64)
+	}
+	if previous, ok := ctx.GetContext(tokenusage.CtxKeyInputTokenDetails).(map[string]int64); ok {
+		for key, value := range previous {
+			if _, exists := usage.InputTokenDetails[key]; !exists {
+				usage.InputTokenDetails[key] = value
+			}
+		}
+	}
+
+	if value := wrapper.GetValueFromBody(data, []string{"message.usage.cache_read_input_tokens"}); value != nil {
+		usage.InputTokenDetails[tokenusage.InputTokenDetailsKeyAnthropicMessagesUsageCacheReadInputTokens] = value.Int()
+	}
+	if value := wrapper.GetValueFromBody(data, []string{"message.usage.cache_creation_input_tokens"}); value != nil {
+		usage.InputTokenDetails[tokenusage.InputTokenDetailsKeyAnthropicMessagesUsageCacheCreationInputTokens] = value.Int()
+	}
+	if value := wrapper.GetValueFromBody(data, []string{"usage.output_tokens"}); value != nil &&
+		bytes.Contains(data, []byte(`"message_delta"`)) {
+		usage.OutputToken = value.Int()
+	}
+
+	cacheRead := usage.InputTokenDetails[tokenusage.InputTokenDetailsKeyAnthropicMessagesUsageCacheReadInputTokens]
+	cacheCreation := usage.InputTokenDetails[tokenusage.InputTokenDetailsKeyAnthropicMessagesUsageCacheCreationInputTokens]
+	if cacheRead > 0 || cacheCreation > 0 || bytes.Contains(data, []byte(`"message_delta"`)) {
+		usage.TotalToken = usage.InputToken + usage.OutputToken + cacheRead + cacheCreation
+	}
 }
 
 func onHttpResponseBody(ctx wrapper.HttpContext, config AIStatisticsConfig, body []byte) types.Action {
