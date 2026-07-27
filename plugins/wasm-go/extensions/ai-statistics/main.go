@@ -928,6 +928,8 @@ func isSemanticStreamEnd(ctx wrapper.HttpContext, data []byte) bool {
 
 	if bytes.Contains(probe, []byte("[DONE]")) ||
 		bytes.Contains(probe, []byte(`"response.completed"`)) ||
+		bytes.Contains(probe, []byte(`"response.incomplete"`)) ||
+		bytes.Contains(probe, []byte(`"response.failed"`)) ||
 		bytes.Contains(probe, []byte(`"message_stop"`)) {
 		return true
 	}
