@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,7 +22,9 @@ import (
 )
 
 const (
-	pluginName = "ai-quota"
+	pluginName             = "ai-quota"
+	quotaChargedContextKey = "ai-quota-charged"
+	quotaTerminalTailKey   = "ai-quota-terminal-tail"
 )
 
 type ChatMode string
@@ -244,33 +247,68 @@ func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config QuotaConfig, da
 	if chatMode == ChatModeNone || chatMode == ChatModeAdmin {
 		return data
 	}
-	if usage := tokenusage.GetTokenUsage(ctx, data); usage.TotalToken > 0 {
+	usage := tokenusage.GetTokenUsage(ctx, data)
+	enrichAnthropicStreamingUsage(ctx, data, &usage)
+	if usage.TotalToken > 0 {
 		ctx.SetContext(tokenusage.CtxKeyInputToken, usage.InputToken)
 		ctx.SetContext(tokenusage.CtxKeyOutputToken, usage.OutputToken)
 		ctx.SetContext(tokenusage.CtxKeyTotalToken, usage.TotalToken)
+		if len(usage.InputTokenDetails) > 0 {
+			ctx.SetContext(tokenusage.CtxKeyInputTokenDetails, usage.InputTokenDetails)
+		}
 	}
 
-	// chat completion mode
-	if !endOfStream {
+	// SSE clients often stop reading after a protocol-level terminal frame without
+	// waiting for transport EOF. Charge on that semantic end as well as the normal
+	// endOfStream callback, with an exactly-once guard.
+	if !endOfStream && !isSemanticStreamEnd(ctx, data) {
 		return data
 	}
+	chargeQuotaOnce(ctx, config)
+	return data
+}
 
+func chargeQuotaOnce(ctx wrapper.HttpContext, config QuotaConfig) {
+	if ctx.GetBoolContext(quotaChargedContextKey, false) {
+		return
+	}
 	if ctx.GetContext("consumer") == nil {
-		return data
+		return
 	}
 
-	totalToken, ok := getQuotaToken(ctx.GetContext(tokenusage.CtxKeyTotalToken), ctx.GetContext(tokenusage.CtxKeyInputToken), ctx.GetContext(tokenusage.CtxKeyOutputToken))
+	totalToken, ok := getQuotaToken(
+		ctx.GetContext(tokenusage.CtxKeyTotalToken),
+		ctx.GetContext(tokenusage.CtxKeyInputToken),
+		ctx.GetContext(tokenusage.CtxKeyOutputToken),
+		ctx.GetContext(tokenusage.CtxKeyInputTokenDetails),
+	)
 	if !ok {
-		return data
+		return
 	}
 
 	consumer := ctx.GetContext("consumer").(string)
 	log.Debugf("update consumer:%s, totalToken:%d", consumer, totalToken)
-	config.redisClient.DecrBy(config.RedisKeyPrefix+consumer, int(totalToken), nil)
-	return data
+	if err := config.redisClient.DecrBy(config.RedisKeyPrefix+consumer, int(totalToken), nil); err != nil {
+		log.Errorf("failed to update consumer %s quota: %v", consumer, err)
+		return
+	}
+	ctx.SetContext(quotaChargedContextKey, true)
 }
 
-func getQuotaToken(totalTokenValue any, inputTokenValue any, outputTokenValue any) (int64, bool) {
+func getQuotaToken(totalTokenValue any, inputTokenValue any, outputTokenValue any, inputTokenDetailsValue ...any) (int64, bool) {
+	if len(inputTokenDetailsValue) > 0 {
+		if details, ok := inputTokenDetailsValue[0].(map[string]int64); ok {
+			cacheRead := details[tokenusage.InputTokenDetailsKeyAnthropicMessagesUsageCacheReadInputTokens]
+			cacheCreation := details[tokenusage.InputTokenDetailsKeyAnthropicMessagesUsageCacheCreationInputTokens]
+			if cacheRead > 0 || cacheCreation > 0 {
+				inputToken, inputOK := inputTokenValue.(int64)
+				outputToken, outputOK := outputTokenValue.(int64)
+				if inputOK && outputOK {
+					return inputToken + outputToken + cacheRead + cacheCreation, true
+				}
+			}
+		}
+	}
 	if totalToken, ok := totalTokenValue.(int64); ok && totalToken > 0 {
 		return totalToken, true
 	}
@@ -281,6 +319,67 @@ func getQuotaToken(totalTokenValue any, inputTokenValue any, outputTokenValue an
 		return 0, false
 	}
 	return inputToken + outputToken, true
+}
+
+func isSemanticStreamEnd(ctx wrapper.HttpContext, data []byte) bool {
+	tail, _ := ctx.GetContext(quotaTerminalTailKey).([]byte)
+	probe := make([]byte, 0, len(tail)+len(data))
+	probe = append(probe, tail...)
+	probe = append(probe, data...)
+
+	const terminalTailBytes = 512
+	if len(probe) > terminalTailBytes {
+		tail = append([]byte(nil), probe[len(probe)-terminalTailBytes:]...)
+	} else {
+		tail = append([]byte(nil), probe...)
+	}
+	ctx.SetContext(quotaTerminalTailKey, tail)
+
+	if bytes.Contains(probe, []byte("[DONE]")) ||
+		bytes.Contains(probe, []byte(`"response.completed"`)) ||
+		bytes.Contains(probe, []byte(`"message_stop"`)) {
+		return true
+	}
+
+	usage := wrapper.GetValueFromBody(data, []string{"usage"})
+	choices := wrapper.GetValueFromBody(data, []string{"choices"})
+	if usage != nil && choices != nil && choices.IsArray() && len(choices.Array()) == 0 {
+		return true
+	}
+
+	return bytes.Contains(probe, []byte(`"message_delta"`)) &&
+		bytes.Contains(probe, []byte(`"stop_reason"`)) &&
+		bytes.Contains(probe, []byte(`"usage"`))
+}
+
+func enrichAnthropicStreamingUsage(ctx wrapper.HttpContext, data []byte, usage *tokenusage.TokenUsage) {
+	if usage.InputTokenDetails == nil {
+		usage.InputTokenDetails = make(map[string]int64)
+	}
+	if previous, ok := ctx.GetContext(tokenusage.CtxKeyInputTokenDetails).(map[string]int64); ok {
+		for key, value := range previous {
+			if _, exists := usage.InputTokenDetails[key]; !exists {
+				usage.InputTokenDetails[key] = value
+			}
+		}
+	}
+
+	if value := wrapper.GetValueFromBody(data, []string{"message.usage.cache_read_input_tokens"}); value != nil {
+		usage.InputTokenDetails[tokenusage.InputTokenDetailsKeyAnthropicMessagesUsageCacheReadInputTokens] = value.Int()
+	}
+	if value := wrapper.GetValueFromBody(data, []string{"message.usage.cache_creation_input_tokens"}); value != nil {
+		usage.InputTokenDetails[tokenusage.InputTokenDetailsKeyAnthropicMessagesUsageCacheCreationInputTokens] = value.Int()
+	}
+	if value := wrapper.GetValueFromBody(data, []string{"usage.output_tokens"}); value != nil &&
+		bytes.Contains(data, []byte(`"message_delta"`)) {
+		usage.OutputToken = value.Int()
+	}
+
+	cacheRead := usage.InputTokenDetails[tokenusage.InputTokenDetailsKeyAnthropicMessagesUsageCacheReadInputTokens]
+	cacheCreation := usage.InputTokenDetails[tokenusage.InputTokenDetailsKeyAnthropicMessagesUsageCacheCreationInputTokens]
+	if cacheRead > 0 || cacheCreation > 0 || bytes.Contains(data, []byte(`"message_delta"`)) {
+		usage.TotalToken = usage.InputToken + usage.OutputToken + cacheRead + cacheCreation
+	}
 }
 
 func deniedNoKeyAuthData() types.Action {

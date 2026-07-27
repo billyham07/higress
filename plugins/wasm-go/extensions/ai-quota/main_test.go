@@ -33,6 +33,7 @@ var basicConfig = func() json.RawMessage {
 		"enable_path_suffixes": []string{
 			"/v1/chat/completions",
 			"/v1/messages",
+			"/v1/responses",
 		},
 		"redis": map[string]interface{}{
 			"service_name": "redis.static",
@@ -81,7 +82,7 @@ func TestParseConfig(t *testing.T) {
 			require.Equal(t, "admin", quotaConfig.AdminConsumer)
 			require.Equal(t, "chat_quota:", quotaConfig.RedisKeyPrefix)
 			require.Equal(t, "/quota", quotaConfig.AdminPath)
-			require.Equal(t, []string{"/v1/chat/completions", "/v1/messages"}, quotaConfig.EnablePathSuffixes)
+			require.Equal(t, []string{"/v1/chat/completions", "/v1/messages", "/v1/responses"}, quotaConfig.EnablePathSuffixes)
 		})
 
 		// 测试缺少admin_consumer的配置
@@ -299,6 +300,98 @@ func TestOnHttpStreamingResponseBody(t *testing.T) {
 			require.Equal(t, data, result)
 		})
 	})
+}
+
+func TestSemanticStreamEndChargesExactlyOnce(t *testing.T) {
+	test.RunTest(t, func(t *testing.T) {
+		tests := []struct {
+			name          string
+			path          string
+			requestBody   []byte
+			chunks        [][]byte
+			terminalChunk []byte
+			wantTotal     string
+		}{
+			{
+				name:        "openai chat final usage without transport eof",
+				path:        "/v1/chat/completions",
+				requestBody: []byte(`{"model":"glm-5.2","stream":true}`),
+				chunks: [][]byte{
+					[]byte(`data: {"model":"glm-5.2","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`),
+				},
+				terminalChunk: []byte(`data: {"model":"glm-5.2","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`),
+				wantTotal:     "12",
+			},
+			{
+				name:        "openai responses completed without transport eof",
+				path:        "/v1/responses",
+				requestBody: []byte(`{"model":"gpt-5","stream":true}`),
+				terminalChunk: []byte(`event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5","usage":{"input_tokens":9,"output_tokens":3,"total_tokens":12}}}`),
+				wantTotal: "12",
+			},
+			{
+				name:        "anthropic final delta includes cache tokens",
+				path:        "/v1/messages",
+				requestBody: []byte(`{"model":"qwen3.8-max-preview","stream":true}`),
+				chunks: [][]byte{
+					[]byte(`event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","model":"qwen3.8-max-preview","usage":{"input_tokens":20,"output_tokens":0,"cache_read_input_tokens":80,"cache_creation_input_tokens":15}}}`),
+				},
+				terminalChunk: []byte(`event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}`),
+				wantTotal: "125",
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				host, status := test.NewTestHost(basicConfig)
+				defer host.Reset()
+				require.Equal(t, types.OnPluginStartStatusOK, status)
+
+				host.CallOnHttpRequestHeaders([][2]string{
+					{":authority", "example.com"},
+					{":path", tc.path},
+					{":method", "POST"},
+					{"x-mse-consumer", "consumer1"},
+				})
+				host.CallOnRedisCall(0, test.CreateRedisResp(1000))
+				host.CallOnHttpRequestBody(tc.requestBody)
+
+				for _, chunk := range tc.chunks {
+					host.CallOnHttpStreamingResponseBody(chunk, false)
+				}
+				calls, _ := redisCalloutCountAndLastQuery(host)
+				require.Equal(t, 0, calls)
+
+				host.CallOnHttpStreamingResponseBody(tc.terminalChunk, false)
+				calls, query := redisCalloutCountAndLastQuery(host)
+				require.Equal(t, 1, calls)
+				require.Contains(t, query, tc.wantTotal)
+
+				// A later protocol sentinel and transport EOF must not charge again.
+				host.CallOnHttpStreamingResponseBody([]byte("data: [DONE]\n\n"), false)
+				host.CallOnHttpStreamingResponseBody(nil, true)
+				calls, _ = redisCalloutCountAndLastQuery(host)
+				require.Equal(t, 1, calls)
+			})
+		}
+	})
+}
+
+func redisCalloutCountAndLastQuery(host test.TestHost) (int, string) {
+	count := 0
+	lastQuery := ""
+	// proxytest uses a process-global monotonically increasing context ID, so
+	// earlier tests may have advanced it well beyond the first few values.
+	for contextID := uint32(0); contextID < 1<<16; contextID++ {
+		for _, callout := range host.GetRedisCalloutAttributesFromContext(contextID) {
+			count++
+			lastQuery = string(callout.Query)
+		}
+	}
+	return count, lastQuery
 }
 
 func TestGetQuotaToken(t *testing.T) {

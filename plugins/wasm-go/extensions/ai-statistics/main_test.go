@@ -970,6 +970,124 @@ func TestMetrics(t *testing.T) {
 	})
 }
 
+func TestSemanticStreamEndWritesMetricsExactlyOnce(t *testing.T) {
+	test.RunTest(t, func(t *testing.T) {
+		tests := []struct {
+			name          string
+			path          string
+			model         string
+			requestBody   []byte
+			chunks        [][]byte
+			terminalChunk []byte
+			wantInput     uint64
+			wantOutput    uint64
+			wantTotal     uint64
+			wantCacheRead uint64
+			wantCacheMake uint64
+		}{
+			{
+				name:        "openai chat final usage without transport eof",
+				path:        "/v1/chat/completions",
+				model:       "glm-5.2",
+				requestBody: []byte(`{"model":"glm-5.2","stream":true}`),
+				chunks: [][]byte{
+					[]byte(`data: {"model":"glm-5.2","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`),
+				},
+				terminalChunk: []byte(`data: {"model":"glm-5.2","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"prompt_tokens_details":{"cached_tokens":8}}}`),
+				wantInput:     10,
+				wantOutput:    2,
+				wantTotal:     12,
+				wantCacheRead: 8,
+			},
+			{
+				name:        "openai responses completed without transport eof",
+				path:        "/v1/responses",
+				model:       "gpt-5",
+				requestBody: []byte(`{"model":"gpt-5","stream":true}`),
+				terminalChunk: []byte(`event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5","usage":{"input_tokens":9,"output_tokens":3,"total_tokens":12,"input_tokens_details":{"cached_tokens":7}}}}`),
+				wantInput:     9,
+				wantOutput:    3,
+				wantTotal:     12,
+				wantCacheRead: 7,
+			},
+			{
+				name:        "anthropic final delta includes cache tokens",
+				path:        "/v1/messages",
+				model:       "qwen3.8-max-preview",
+				requestBody: []byte(`{"model":"qwen3.8-max-preview","stream":true}`),
+				chunks: [][]byte{
+					[]byte(`event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","model":"qwen3.8-max-preview","usage":{"input_tokens":20,"output_tokens":0,"cache_read_input_tokens":80,"cache_creation_input_tokens":15}}}`),
+				},
+				terminalChunk: []byte(`event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}`),
+				wantInput:     20,
+				wantOutput:    10,
+				wantTotal:     125,
+				wantCacheRead: 80,
+				wantCacheMake: 15,
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				host, status := test.NewTestHost(streamingBodyConfig)
+				defer host.Reset()
+				require.Equal(t, types.OnPluginStartStatusOK, status)
+				host.SetRouteName("semantic-route")
+				host.SetClusterName("cluster-1")
+
+				host.CallOnHttpRequestHeaders([][2]string{
+					{":authority", "example.com"},
+					{":path", tc.path},
+					{":method", "POST"},
+					{"x-mse-consumer", "consumer1"},
+				})
+				host.CallOnHttpRequestBody(tc.requestBody)
+				host.CallOnHttpResponseHeaders([][2]string{
+					{":status", "200"},
+					{"content-type", "text/event-stream"},
+				})
+
+				for _, chunk := range tc.chunks {
+					host.CallOnHttpStreamingResponseBody(chunk, false)
+				}
+				host.CallOnHttpStreamingResponseBody(tc.terminalChunk, false)
+
+				prefix := "route.semantic-route.upstream.cluster-1.model." + tc.model + ".consumer.consumer1.metric."
+				input, err := host.GetCounterMetric(prefix + "input_token")
+				require.NoError(t, err)
+				require.Equal(t, tc.wantInput, input)
+				output, err := host.GetCounterMetric(prefix + "output_token")
+				require.NoError(t, err)
+				require.Equal(t, tc.wantOutput, output)
+				total, err := host.GetCounterMetric(prefix + "total_token")
+				require.NoError(t, err)
+				require.Equal(t, tc.wantTotal, total)
+
+				if tc.wantCacheRead > 0 {
+					cached, err := host.GetCounterMetric(prefix + CachedToken)
+					require.NoError(t, err)
+					require.Equal(t, tc.wantCacheRead, cached)
+				}
+				if tc.wantCacheMake > 0 {
+					created, err := host.GetCounterMetric(prefix + CacheCreationInputToken)
+					require.NoError(t, err)
+					require.Equal(t, tc.wantCacheMake, created)
+				}
+
+				// Neither a later sentinel nor transport EOF may duplicate counters.
+				host.CallOnHttpStreamingResponseBody([]byte("data: [DONE]\n\n"), false)
+				host.CallOnHttpStreamingResponseBody(nil, true)
+				total, err = host.GetCounterMetric(prefix + "total_token")
+				require.NoError(t, err)
+				require.Equal(t, tc.wantTotal, total)
+			})
+		}
+	})
+}
+
 func TestCompleteFlow(t *testing.T) {
 	test.RunTest(t, func(t *testing.T) {
 		// 测试完整的统计流程
