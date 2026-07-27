@@ -750,7 +750,13 @@ func TestMetrics(t *testing.T) {
 			// 3. 处理响应体
 			responseBody := []byte(`{
 				"choices": [{"message": {"content": "Hello, how can I help you?"}}],
-				"usage": {"prompt_tokens": 5, "completion_tokens": 8, "total_tokens": 13},
+				"usage": {
+					"prompt_tokens": 5,
+					"completion_tokens": 8,
+					"total_tokens": 13,
+					"prompt_tokens_details": {"cached_tokens": 3},
+					"completion_tokens_details": {"reasoning_tokens": 2}
+				},
 				"model": "gpt-3.5-turbo"
 			}`)
 			host.CallOnHttpResponseBody(responseBody)
@@ -776,6 +782,16 @@ func TestMetrics(t *testing.T) {
 			totalTokenValue, err := host.GetCounterMetric(totalTokenMetric)
 			require.NoError(t, err)
 			require.Equal(t, uint64(13), totalTokenValue)
+
+			cachedTokenMetric := "route.api-v1.upstream.cluster-1.model.gpt-3.5-turbo.consumer.user1.metric.cached_token"
+			cachedTokenValue, err := host.GetCounterMetric(cachedTokenMetric)
+			require.NoError(t, err)
+			require.Equal(t, uint64(3), cachedTokenValue)
+
+			reasoningTokenMetric := "route.api-v1.upstream.cluster-1.model.gpt-3.5-turbo.consumer.user1.metric.reasoning_token"
+			reasoningTokenValue, err := host.GetCounterMetric(reasoningTokenMetric)
+			require.NoError(t, err)
+			require.Equal(t, uint64(2), reasoningTokenValue)
 
 			// 检查服务时长指标
 			serviceDurationMetric := "route.api-v1.upstream.cluster-1.model.gpt-3.5-turbo.consumer.user1.metric.llm_service_duration"
@@ -843,7 +859,7 @@ func TestMetrics(t *testing.T) {
 			require.Equal(t, firstChunk, result)
 
 			// 5. 处理最后一个流式块 - 添加 usage 信息
-			lastChunk := []byte(`data: {"choices":[{"message":{"content":"How can I help you?"}}],"model":"gpt-4","usage":{"prompt_tokens":5,"completion_tokens":8,"total_tokens":13}}`)
+			lastChunk := []byte(`data: {"choices":[{"message":{"content":"How can I help you?"}}],"model":"gpt-4","usage":{"prompt_tokens":5,"completion_tokens":8,"total_tokens":13,"prompt_tokens_details":{"cached_tokens":3},"completion_tokens_details":{"reasoning_tokens":2}}}`)
 			action = host.CallOnHttpStreamingResponseBody(lastChunk, true)
 
 			// 应该返回原始数据
@@ -892,6 +908,59 @@ func TestMetrics(t *testing.T) {
 			totalTokenValue, err := host.GetCounterMetric(totalTokenMetric)
 			require.NoError(t, err)
 			require.Equal(t, uint64(13), totalTokenValue)
+
+			cachedTokenMetric := "route.api-v1.upstream.cluster-1.model.gpt-4.consumer.user2.metric.cached_token"
+			cachedTokenValue, err := host.GetCounterMetric(cachedTokenMetric)
+			require.NoError(t, err)
+			require.Equal(t, uint64(3), cachedTokenValue)
+
+			reasoningTokenMetric := "route.api-v1.upstream.cluster-1.model.gpt-4.consumer.user2.metric.reasoning_token"
+			reasoningTokenValue, err := host.GetCounterMetric(reasoningTokenMetric)
+			require.NoError(t, err)
+			require.Equal(t, uint64(2), reasoningTokenValue)
+		})
+
+		t.Run("test anthropic cache detail metrics", func(t *testing.T) {
+			host, status := test.NewTestHost(tokenDetailsConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			host.SetRouteName("api-v1")
+			host.SetClusterName("cluster-1")
+			host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/v1/messages"},
+				{":method", "POST"},
+				{"x-mse-consumer", "anthropic-user"},
+			})
+			host.CallOnHttpRequestBody([]byte(`{
+				"model": "qwen3.8-max-preview",
+				"messages": [{"role": "user", "content": "Hello"}]
+			}`))
+			host.CallOnHttpResponseHeaders([][2]string{
+				{":status", "200"},
+				{"content-type", "application/json"},
+			})
+			host.CallOnHttpResponseBody([]byte(`{
+				"model": "qwen3.8-max-preview",
+				"usage": {
+					"input_tokens": 20,
+					"output_tokens": 10,
+					"cache_read_input_tokens": 80,
+					"cache_creation_input_tokens": 15
+				}
+			}`))
+			host.CompleteHttp()
+
+			cachedTokenMetric := "route.api-v1.upstream.cluster-1.model.qwen3.8-max-preview.consumer.anthropic-user.metric.cached_token"
+			cachedTokenValue, err := host.GetCounterMetric(cachedTokenMetric)
+			require.NoError(t, err)
+			require.Equal(t, uint64(80), cachedTokenValue)
+
+			cacheCreationMetric := "route.api-v1.upstream.cluster-1.model.qwen3.8-max-preview.consumer.anthropic-user.metric.cache_creation_input_token"
+			cacheCreationValue, err := host.GetCounterMetric(cacheCreationMetric)
+			require.NoError(t, err)
+			require.Equal(t, uint64(15), cacheCreationValue)
 		})
 	})
 }
