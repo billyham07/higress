@@ -10,6 +10,18 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestQwenCompatibleModeIncludesModelsCapability(t *testing.T) {
+	capabilities := (&qwenProviderInitializer{}).DefaultCapabilities(true)
+
+	assert.Equal(t, qwenCompatibleModelsPath, capabilities[string(ApiNameModels)])
+}
+
+func TestQwenOriginalProtocolRecognizesCompatibleModelsPath(t *testing.T) {
+	provider := &qwenProvider{}
+
+	assert.Equal(t, ApiNameModels, provider.GetApiName(qwenCompatibleModelsPath))
+}
+
 func TestChatMessage2QwenMessagePreservesReasoningContent(t *testing.T) {
 	t.Run("string content", func(t *testing.T) {
 		msg := chatMessage{

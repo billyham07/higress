@@ -31,6 +31,7 @@ const (
 	qwenCompatibleChatCompletionPath      = "/compatible-mode/v1/chat/completions"
 	qwenCompatibleCompletionsPath         = "/compatible-mode/v1/completions"
 	qwenCompatibleTextEmbeddingPath       = "/compatible-mode/v1/embeddings"
+	qwenCompatibleModelsPath              = "/compatible-mode/v1/models"
 	qwenCompatibleConversationsPath       = "/compatible-mode/v1/conversations"
 	qwenCompatibleResponsesPath           = "/compatible-mode/v1/responses"
 	qwenCompatibleFilesPath               = "/compatible-mode/v1/files"
@@ -71,6 +72,7 @@ func (m *qwenProviderInitializer) DefaultCapabilities(qwenEnableCompatible bool)
 		return map[string]string{
 			string(ApiNameChatCompletion):      qwenCompatibleChatCompletionPath,
 			string(ApiNameEmbeddings):          qwenCompatibleTextEmbeddingPath,
+			string(ApiNameModels):              qwenCompatibleModelsPath,
 			string(ApiNameCompletion):          qwenCompatibleCompletionsPath,
 			string(ApiNameResponses):           qwenCompatibleResponsesPath,
 			string(ApiNameFiles):               qwenCompatibleFilesPath,
@@ -763,6 +765,8 @@ func (m *qwenProvider) GetApiName(path string) ApiName {
 	case strings.Contains(path, qwenTextEmbeddingPath),
 		strings.Contains(path, qwenCompatibleTextEmbeddingPath):
 		return ApiNameEmbeddings
+	case strings.Contains(path, qwenCompatibleModelsPath):
+		return ApiNameModels
 	case strings.Contains(path, qwenCompatibleResponsesPath):
 		return ApiNameResponses
 	case strings.Contains(path, qwenAsyncAIGCPath):

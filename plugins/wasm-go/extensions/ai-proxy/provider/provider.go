@@ -725,6 +725,7 @@ func (c *ProviderConfig) FromJson(json gjson.Result) {
 		switch capability {
 		case string(ApiNameChatCompletion),
 			string(ApiNameEmbeddings),
+			string(ApiNameModels),
 			string(ApiNameImageGeneration),
 			string(ApiNameImageVariation),
 			string(ApiNameImageEdit),
