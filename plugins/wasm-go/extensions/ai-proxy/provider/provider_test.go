@@ -712,6 +712,18 @@ func TestProviderConfig_IsSupportedAPI(t *testing.T) {
 	})
 }
 
+func TestProviderConfig_FromJsonAllowsModelsCapability(t *testing.T) {
+	var config ProviderConfig
+	config.FromJson(gjson.Parse(`{
+		"type":"qwen",
+		"protocol":"openai",
+		"apiTokens":["test-token"],
+		"capabilities":{"openai/v1/models":"/compatible-mode/v1/models"}
+	}`))
+
+	assert.Equal(t, "/compatible-mode/v1/models", config.capabilities[string(ApiNameModels)])
+}
+
 func TestProviderConfig_SetDefaultCapabilities(t *testing.T) {
 	t.Run("set_when_nil", func(t *testing.T) {
 		config := &ProviderConfig{

@@ -452,6 +452,30 @@ func RunQwenOnHttpRequestHeadersTests(t *testing.T) {
 			require.Contains(t, pathValue, "/compatible-mode/v1/chat/completions", "Path should use compatible mode path")
 		})
 
+		// 测试qwen兼容模式请求头处理（models接口，包含AI路由前缀）
+		t.Run("qwen compatible mode models request headers with route prefix", func(t *testing.T) {
+			host, status := test.NewTestHost(qwenEnableCompatibleConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			action := host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/bailian/v1/models"},
+				{":method", "GET"},
+			})
+
+			// The test host treats the request as having a body, so header processing pauses here.
+			require.Equal(t, types.HeaderStopIteration, action)
+
+			requestHeaders := host.GetRequestHeaders()
+			require.NotNil(t, requestHeaders)
+
+			pathValue, hasPath := test.GetHeaderValue(requestHeaders, ":path")
+			require.True(t, hasPath)
+			require.Equal(t, "/compatible-mode/v1/models", pathValue,
+				"Models path should drop the route prefix and use the Qwen compatible endpoint")
+		})
+
 		// 测试qwen兼容模式请求头处理（responses接口）
 		t.Run("qwen compatible mode responses request headers", func(t *testing.T) {
 			host, status := test.NewTestHost(qwenEnableCompatibleConfig)
@@ -922,6 +946,10 @@ func RunQwenOnHttpRequestBodyTests(t *testing.T) {
 				{
 					name: "compatible embeddings path",
 					path: "/compatible-mode/v1/embeddings",
+				},
+				{
+					name: "compatible models path",
+					path: "/compatible-mode/v1/models",
 				},
 				{
 					name: "compatible responses path",
