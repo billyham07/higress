@@ -1,0 +1,28 @@
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: vllm-compat
+  namespace: higress-system
+  labels:
+    app.kubernetes.io/name: vllm-compat
+spec:
+  url: oci://yxdc-registry.cn-shenzhen.cr.aliyuncs.com/dockerhub/higress-wasm/vllm-compat:1.0.0
+  # AUTHZ runs after key-auth (AUTHN, which injects x-mse-consumer) and before
+  # ai-proxy, which sits in the default phase at the end of the chain.
+  phase: AUTHZ
+  priority: 200
+  # A translation failure must never take the route down: on failure the request
+  # is passed through untouched, which is exactly today's behaviour.
+  failStrategy: FAIL_OPEN
+  # No global default: the plugin only applies where it is explicitly attached,
+  # because the guided_* -> regex/ebnf mapping is SGLang-specific.
+  defaultConfigDisable: true
+  matchRules:
+    # Scope 1: only the SGLang-backed routes.
+    - ingress:
+        - ai-route-qwen3.5.internal
+      config:
+        # Scope 2: only this SaaS's consumer while we soak it.
+        # Empty the list to let every caller on the route benefit.
+        consumers:
+          - u-linxumin-j19kx
