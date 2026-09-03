@@ -6,7 +6,7 @@ metadata:
   labels:
     app.kubernetes.io/name: vllm-compat
 spec:
-  url: oci://yxdc-registry.cn-shenzhen.cr.aliyuncs.com/dockerhub/higress-wasm/vllm-compat:1.0.0
+  url: oci://yxdc-registry.cn-shenzhen.cr.aliyuncs.com/dockerhub/higress-wasm/vllm-compat:1.0.0@sha256:439724e631887693877aef57df24f28e936f662f2def5a9d2cfa5dbdbec99593
   # AUTHZ runs after key-auth (AUTHN, which injects x-mse-consumer) and before
   # ai-proxy, which sits in the default phase at the end of the chain.
   phase: AUTHZ
@@ -18,11 +18,11 @@ spec:
   # because the guided_* -> regex/ebnf mapping is SGLang-specific.
   defaultConfigDisable: true
   matchRules:
-    # Scope 1: only the SGLang-backed routes.
+    # Scoped to the SGLang-backed route only: the guided_* -> regex/ebnf mapping
+    # would be wrong in front of a real vLLM upstream.
     - ingress:
         - ai-route-qwen3.5.internal
-      config:
-        # Scope 2: only this SaaS's consumer while we soak it.
-        # Empty the list to let every caller on the route benefit.
-        consumers:
-          - u-linxumin-j19kx
+      # No consumer allowlist: the rewrite is a no-op for anyone who does not
+      # send guided_* fields, so every caller on this route can benefit.
+      # Add `consumers: [<consumer-id>]` here to narrow it back down.
+      config: {}

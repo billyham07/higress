@@ -6,13 +6,13 @@
 
 ## 字段映射
 
-| 客户端发的（vLLM） | 改写成（后端认识的） |
+| 客户端发的（vLLM 方言） | 改写成（后端认识的） |
 |---|---|
-| `guided_json`（对象或 JSON 字符串） | `response_format = {"type":"json_schema","json_schema":{"name":…,"schema":…}}` |
-| `guided_choice: ["a","b"]` | `regex = "(a\|b)"`（元字符已转义） |
-| `guided_regex` | `regex` |
-| `guided_grammar` | `ebnf` |
-| `guided_decoding_backend`、`guided_whitespace_pattern` | 删除（只在有 guided_* 时才跟着删） |
+| `guided_json` / `structured_outputs.json`（对象或 JSON 字符串） | `response_format = {"type":"json_schema","json_schema":{"name":…,"schema":…}}` |
+| `guided_choice` / `structured_outputs.choice` | `regex = "(a|b)"`（元字符已转义） |
+| `guided_regex` / `structured_outputs.regex` | `regex` |
+| `guided_grammar` / `structured_outputs.grammar` | `ebnf` |
+| `guided_decoding_backend`、`guided_whitespace_pattern`、`structured_outputs` 剩余键 | 删除（仅当同组字段确实被翻译时） |
 
 `guided_regex` 比 `guided_choice` 更具体，两者同时出现时前者优先，后者原样保留以便上游发现冲突。
 

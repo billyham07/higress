@@ -132,3 +132,62 @@ func TestMalformedGuidedJsonIsLeftAlone(t *testing.T) {
 	assert.Empty(t, res.applied)
 	assert.JSONEq(t, string(body), string(out))
 }
+
+// The requests below are the ones the SaaS actually sends: vLLM's newer nested
+// structured_outputs object rather than the flat guided_* fields.
+func TestStructuredOutputsJson(t *testing.T) {
+	body := []byte(`{"messages":[{"content":"Return status=ok,score=1.","role":"user"}],"model":"qwen3.5","structured_outputs":{"json":{"additionalProperties":false,"properties":{"score":{"type":"integer"},"status":{"type":"string"}},"required":["status","score"],"type":"object"}}}`)
+	out, res := transformBody(body, defaultConfig())
+	require.Equal(t, []string{"structured_outputs.json"}, res.applied)
+
+	assert.Equal(t, "json_schema", gjson.GetBytes(out, "response_format.type").String())
+	assert.JSONEq(t,
+		`{"additionalProperties":false,"properties":{"score":{"type":"integer"},"status":{"type":"string"}},"required":["status","score"],"type":"object"}`,
+		gjson.GetBytes(out, "response_format.json_schema.schema").Raw)
+	assert.False(t, gjson.GetBytes(out, "structured_outputs").Exists())
+	assert.Equal(t, "qwen3.5", gjson.GetBytes(out, "model").String())
+}
+
+func TestStructuredOutputsChoice(t *testing.T) {
+	body := []byte(`{"messages":[{"content":"Answer with either positive or negative.","role":"user"}],"model":"qwen3.5","structured_outputs":{"choice":["positive","negative"]}}`)
+	out, res := transformBody(body, defaultConfig())
+	require.Equal(t, []string{"structured_outputs.choice"}, res.applied)
+	assert.Equal(t, "(positive|negative)", gjson.GetBytes(out, "regex").String())
+	assert.False(t, gjson.GetBytes(out, "structured_outputs").Exists())
+}
+
+func TestStructuredOutputsSiblingsGoWithIt(t *testing.T) {
+	body := []byte(`{"model":"qwen3.5","structured_outputs":{"json":{"type":"object"},"backend":"xgrammar","whitespace_pattern":"\s*"}}`)
+	out, res := transformBody(body, defaultConfig())
+	require.NotEmpty(t, res.applied)
+	// The leftover keys describe a constraint the upstream cannot act on.
+	assert.False(t, gjson.GetBytes(out, "structured_outputs").Exists())
+}
+
+func TestStructuredOutputsGrammarAndRegex(t *testing.T) {
+	body := []byte(`{"model":"qwen3.5","structured_outputs":{"regex":"[0-9]{4}"}}`)
+	out, res := transformBody(body, defaultConfig())
+	require.Equal(t, []string{"structured_outputs.regex"}, res.applied)
+	assert.Equal(t, "[0-9]{4}", gjson.GetBytes(out, "regex").String())
+
+	body = []byte(`{"model":"qwen3.5","structured_outputs":{"grammar":"root ::= \"a\""}}`)
+	out, res = transformBody(body, defaultConfig())
+	require.Equal(t, []string{"structured_outputs.grammar"}, res.applied)
+	assert.Equal(t, `root ::= "a"`, gjson.GetBytes(out, "ebnf").String())
+}
+
+func TestFlatGuidedStillWinsOverNested(t *testing.T) {
+	body := []byte(`{"guided_json":{"type":"object","properties":{"a":{"type":"string"}}},"structured_outputs":{"json":{"type":"object","properties":{"b":{"type":"string"}}}}}`)
+	out, res := transformBody(body, defaultConfig())
+	require.Equal(t, []string{"guided_json"}, res.applied)
+	assert.True(t, gjson.GetBytes(out, "response_format.json_schema.schema.properties.a").Exists())
+	// Nothing consumed from structured_outputs, so it stays as the caller sent it.
+	assert.True(t, gjson.GetBytes(out, "structured_outputs").Exists())
+}
+
+func TestStructuredOutputsUnknownKeyIsNoOp(t *testing.T) {
+	body := []byte(`{"model":"qwen3.5","structured_outputs":{"backend":"xgrammar"}}`)
+	out, res := transformBody(body, defaultConfig())
+	assert.Empty(t, res.applied)
+	assert.JSONEq(t, string(body), string(out))
+}

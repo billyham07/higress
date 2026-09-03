@@ -32,6 +32,8 @@ const (
 	defaultConsumerHeader = "x-mse-consumer"
 	defaultSchemaName     = "guided_json"
 	defaultMaxBodyBytes   = 10 * 1024 * 1024
+	defaultDebugBodyLimit = 4096
+	ctxKeyLogBody         = "vllm_compat_log_body"
 )
 
 func main() {}
@@ -49,7 +51,10 @@ type Config struct {
 	consumerHeader string
 	// consumers limits the rewrite to specific authenticated callers. Empty means
 	// every caller on the routes this plugin is attached to.
-	consumers          map[string]struct{}
+	consumers map[string]struct{}
+	// debugLogConsumers dumps the raw request body for these consumers. It is a
+	// short-lived troubleshooting aid, not something to leave switched on.
+	debugLogConsumers  map[string]struct{}
 	enableOnPathSuffix []string
 	// overwriteExisting decides what happens when the caller sent both a vLLM
 	// field and its standard equivalent. Off by default: an explicit standard
@@ -79,6 +84,13 @@ func parseConfig(cfg gjson.Result, config *Config) error {
 	for _, item := range consumers.Array() {
 		if name := strings.TrimSpace(item.String()); name != "" {
 			config.consumers[name] = struct{}{}
+		}
+	}
+
+	config.debugLogConsumers = make(map[string]struct{})
+	for _, item := range cfg.Get("debugLogConsumers").Array() {
+		if name := strings.TrimSpace(item.String()); name != "" {
+			config.debugLogConsumers[name] = struct{}{}
 		}
 	}
 
@@ -137,16 +149,22 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config Config) types.Action {
 		return types.ActionContinue
 	}
 
+	// key-auth injects this header once it has authenticated the caller.
+	consumer, err := proxywasm.GetHttpRequestHeader(config.consumerHeader)
+	if err != nil {
+		consumer = ""
+	}
+	consumer = strings.TrimSpace(consumer)
+
 	if len(config.consumers) > 0 {
-		// key-auth injects this header once it has authenticated the caller.
-		consumer, err := proxywasm.GetHttpRequestHeader(config.consumerHeader)
-		if err != nil {
-			consumer = ""
-		}
-		if _, ok := config.consumers[strings.TrimSpace(consumer)]; !ok {
+		if _, ok := config.consumers[consumer]; !ok {
 			ctx.DontReadRequestBody()
 			return types.ActionContinue
 		}
+	}
+
+	if _, ok := config.debugLogConsumers[consumer]; ok {
+		ctx.SetContext(ctxKeyLogBody, true)
 	}
 
 	// The rewrite changes the body length, so the original content-length must go.
@@ -162,6 +180,16 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 	if !json.Valid(body) {
 		// Not our business to reject it; let the upstream produce the error.
 		return types.ActionContinue
+	}
+
+	if flag, ok := ctx.GetContext(ctxKeyLogBody).(bool); ok && flag {
+		// Deliberately at Warn so it shows up without turning the whole wasm
+		// logger to debug. Only ever armed for an explicitly named consumer.
+		snippet := body
+		if len(snippet) > defaultDebugBodyLimit {
+			snippet = snippet[:defaultDebugBodyLimit]
+		}
+		log.Warnf("[debug-body] %s", string(snippet))
 	}
 
 	newBody, result := transformBody(body, &config)
@@ -187,7 +215,28 @@ type rewriteResult struct {
 	skipped []string
 }
 
-// transformBody translates vLLM guided-decoding fields into the equivalents the
+// Constraint sources, in priority order. vLLM moved from the flat guided_*
+// fields to a nested structured_outputs object; clients in the wild send either,
+// so both are accepted and translated to the same target.
+var (
+	schemaPaths  = []string{"guided_json", "structured_outputs.json"}
+	choicePaths  = []string{"guided_choice", "structured_outputs.choice"}
+	regexPaths   = []string{"guided_regex", "structured_outputs.regex"}
+	grammarPaths = []string{"guided_grammar", "structured_outputs.grammar"}
+)
+
+// pick returns the first of paths that is present in body, along with the path
+// it came from, so callers can report and strip the exact field they consumed.
+func pick(body []byte, paths []string) (gjson.Result, string) {
+	for _, path := range paths {
+		if value := gjson.GetBytes(body, path); value.Exists() {
+			return value, path
+		}
+	}
+	return gjson.Result{}, ""
+}
+
+// transformBody translates vLLM structured-output fields into the equivalents the
 // SGLang/OpenAI-compatible upstream actually honours. It is a no-op for any
 // request that carries none of them, and never rewrites a field the caller set
 // itself unless overwriteExisting is on.
@@ -195,85 +244,96 @@ func transformBody(body []byte, config *Config) ([]byte, rewriteResult) {
 	var result rewriteResult
 
 	if config.guidedJson {
-		if schema := gjson.GetBytes(body, "guided_json"); schema.Exists() {
+		if schema, from := pick(body, schemaPaths); from != "" {
 			switch {
 			case !config.overwriteExisting && gjson.GetBytes(body, "response_format").Exists():
-				result.skipped = append(result.skipped, "response_format already set, guided_json left untouched")
+				result.skipped = append(result.skipped, "response_format already set, "+from+" left untouched")
 			default:
 				raw, ok := schemaObject(schema)
 				if !ok {
-					result.skipped = append(result.skipped, "guided_json is neither an object nor a JSON-encoded object, left untouched")
+					result.skipped = append(result.skipped, from+" is neither an object nor a JSON-encoded object, left untouched")
 					break
 				}
 				updated, err := sjson.SetRawBytes(body, "response_format", []byte(buildJsonSchemaFormat(config.schemaName, raw)))
 				if err != nil {
-					result.skipped = append(result.skipped, "failed to build response_format from guided_json: "+err.Error())
+					result.skipped = append(result.skipped, "failed to build response_format from "+from+": "+err.Error())
 					break
 				}
 				body = updated
-				result.applied = append(result.applied, "guided_json")
+				result.applied = append(result.applied, from)
 			}
 		}
 	}
 
-	// guided_regex and guided_choice both land on `regex`; an explicit pattern is
+	// The regex and choice sources both land on `regex`; an explicit pattern is
 	// more specific than a choice list, so it wins when a caller sends both.
 	regexSet := false
 	if config.guidedRegex {
-		if pattern := gjson.GetBytes(body, "guided_regex"); pattern.Type == gjson.String {
+		if pattern, from := pick(body, regexPaths); pattern.Type == gjson.String {
 			if !config.overwriteExisting && gjson.GetBytes(body, "regex").Exists() {
-				result.skipped = append(result.skipped, "regex already set, guided_regex left untouched")
+				result.skipped = append(result.skipped, "regex already set, "+from+" left untouched")
 			} else if updated, err := sjson.SetBytes(body, "regex", pattern.String()); err != nil {
-				result.skipped = append(result.skipped, "failed to set regex from guided_regex: "+err.Error())
+				result.skipped = append(result.skipped, "failed to set regex from "+from+": "+err.Error())
 			} else {
 				body = updated
 				regexSet = true
-				result.applied = append(result.applied, "guided_regex")
+				result.applied = append(result.applied, from)
 			}
 		}
 	}
 
 	if config.guidedChoice && !regexSet {
-		if choices := gjson.GetBytes(body, "guided_choice"); choices.IsArray() {
+		if choices, from := pick(body, choicePaths); choices.IsArray() {
 			pattern, ok := choicesToRegex(choices.Array())
 			switch {
 			case !ok:
-				result.skipped = append(result.skipped, "guided_choice is not a non-empty list of strings, left untouched")
+				result.skipped = append(result.skipped, from+" is not a non-empty list of strings, left untouched")
 			case !config.overwriteExisting && gjson.GetBytes(body, "regex").Exists():
-				result.skipped = append(result.skipped, "regex already set, guided_choice left untouched")
+				result.skipped = append(result.skipped, "regex already set, "+from+" left untouched")
 			default:
 				updated, err := sjson.SetBytes(body, "regex", pattern)
 				if err != nil {
-					result.skipped = append(result.skipped, "failed to set regex from guided_choice: "+err.Error())
+					result.skipped = append(result.skipped, "failed to set regex from "+from+": "+err.Error())
 					break
 				}
 				body = updated
-				result.applied = append(result.applied, "guided_choice")
+				result.applied = append(result.applied, from)
 			}
 		}
 	}
 
 	if config.guidedGrammar {
-		if grammar := gjson.GetBytes(body, "guided_grammar"); grammar.Type == gjson.String {
+		if grammar, from := pick(body, grammarPaths); grammar.Type == gjson.String {
 			if !config.overwriteExisting && gjson.GetBytes(body, "ebnf").Exists() {
-				result.skipped = append(result.skipped, "ebnf already set, guided_grammar left untouched")
+				result.skipped = append(result.skipped, "ebnf already set, "+from+" left untouched")
 			} else if updated, err := sjson.SetBytes(body, "ebnf", grammar.String()); err != nil {
-				result.skipped = append(result.skipped, "failed to set ebnf from guided_grammar: "+err.Error())
+				result.skipped = append(result.skipped, "failed to set ebnf from "+from+": "+err.Error())
 			} else {
 				body = updated
-				result.applied = append(result.applied, "guided_grammar")
+				result.applied = append(result.applied, from)
 			}
 		}
 	}
 
 	if len(result.applied) > 0 && config.stripSource {
+		drop := append([]string{}, result.applied...)
 		// guided_decoding_backend / guided_whitespace_pattern only make sense
 		// alongside a guided_* field, so they go with the ones we translated.
-		drop := append([]string{}, result.applied...)
 		drop = append(drop, "guided_decoding_backend", "guided_whitespace_pattern")
 		for _, key := range drop {
 			if updated, err := sjson.DeleteBytes(body, key); err == nil {
 				body = updated
+			}
+		}
+		// Whatever is left inside structured_outputs (backend, whitespace_pattern,
+		// an untranslated sibling) describes a constraint the upstream cannot act
+		// on, so the whole object goes once we have consumed part of it.
+		for _, key := range result.applied {
+			if strings.HasPrefix(key, "structured_outputs.") {
+				if updated, err := sjson.DeleteBytes(body, "structured_outputs"); err == nil {
+					body = updated
+				}
+				break
 			}
 		}
 	}
