@@ -6,7 +6,7 @@ metadata:
   labels:
     app.kubernetes.io/name: vllm-compat
 spec:
-  url: oci://yxdc-registry.cn-shenzhen.cr.aliyuncs.com/dockerhub/higress-wasm/vllm-compat:1.0.0@sha256:439724e631887693877aef57df24f28e936f662f2def5a9d2cfa5dbdbec99593
+  url: oci://yxdc-registry.cn-shenzhen.cr.aliyuncs.com/dockerhub/higress-wasm/vllm-compat:1.0.2@sha256:1d1c1053ac10a2d11472628d54f876c147d1c63e30bf55f3e55db29461d52994
   # AUTHZ runs after key-auth (AUTHN, which injects x-mse-consumer) and before
   # ai-proxy, which sits in the default phase at the end of the chain.
   phase: AUTHZ
