@@ -52,6 +52,7 @@ type ModelRouterConfig struct {
 	enableAutoRouting bool
 	autoRoutingRules  []AutoRoutingRule
 	defaultModel      string
+	registry          *Registry
 }
 
 func parseConfig(json gjson.Result, config *ModelRouterConfig) error {
@@ -114,10 +115,43 @@ func parseConfig(json gjson.Result, config *ModelRouterConfig) error {
 		}
 	}
 
+	registry, err := parseRegistry(json)
+	if err != nil {
+		return err
+	}
+	config.registry = registry
+
 	return nil
 }
 
+func stripClientInternalHeaders(config ModelRouterConfig) {
+	headers := defaultInternalHeaders
+	if config.registry != nil && len(config.registry.StripHeaders) > 0 {
+		headers = config.registry.StripHeaders
+	}
+	seen := map[string]struct{}{}
+	for _, name := range headers {
+		key := strings.ToLower(strings.TrimSpace(name))
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		_ = proxywasm.RemoveHttpRequestHeader(key)
+	}
+	if config.modelToHeader != "" {
+		_ = proxywasm.RemoveHttpRequestHeader(config.modelToHeader)
+	}
+	if config.addProviderHeader != "" {
+		_ = proxywasm.RemoveHttpRequestHeader(config.addProviderHeader)
+	}
+}
+
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config ModelRouterConfig) types.Action {
+	stripClientInternalHeaders(config)
+
 	path, err := proxywasm.GetHttpRequestHeader(":path")
 	if err != nil {
 		return types.ActionContinue
@@ -208,6 +242,9 @@ func handleJsonBody(ctx wrapper.HttpContext, config ModelRouterConfig, body []by
 	}
 	modelValue := gjson.GetBytes(body, config.modelKey).String()
 	if modelValue == "" {
+		if config.registry != nil && config.registry.Enabled {
+			return rejectModelRoute(ctx, errMissingModel, "request is missing model")
+		}
 		return types.ActionContinue
 	}
 
@@ -228,20 +265,30 @@ func handleJsonBody(ctx wrapper.HttpContext, config ModelRouterConfig, body []by
 		}
 
 		if targetModel != "" {
-			// Set the matched model to the header for routing
-			_ = proxywasm.ReplaceHttpRequestHeader("x-higress-llm-model", targetModel)
-			// Update the model field in the request body
+			modelValue = targetModel
 			newBody, err := sjson.SetBytes(body, config.modelKey, targetModel)
 			if err != nil {
 				log.Errorf("failed to update model in auto routing json body: %v", err)
 				return types.ActionContinue
 			}
+			body = newBody
 			_ = proxywasm.ReplaceHttpRequestBody(newBody)
 			log.Debugf("auto routing: updated body model field to: %s", targetModel)
+			if config.registry == nil || !config.registry.Enabled {
+				_ = proxywasm.ReplaceHttpRequestHeader("x-higress-llm-model", targetModel)
+				return types.ActionContinue
+			}
 		} else {
 			log.Warnf("auto routing: no rule matched and no default model configured")
+			return types.ActionContinue
 		}
-		return types.ActionContinue
+	}
+
+	if config.registry != nil && config.registry.Enabled {
+		if config.registry.publicationBlocked() {
+			return rejectModelRoute(ctx, errRegistryUnavailable, "unified registry has no published models")
+		}
+		return applyPublishedModelRoute(ctx, config, body, modelValue)
 	}
 
 	if config.modelToHeader != "" {
@@ -312,11 +359,22 @@ func handleMultipartBody(ctx wrapper.HttpContext, config ModelRouterConfig, body
 		if formName == config.modelKey {
 			modelValue := string(partContent)
 
-			if config.modelToHeader != "" {
+			if config.registry != nil && config.registry.Enabled {
+				path, _ := proxywasm.GetHttpRequestHeader(":path")
+				resolved := config.registry.Resolve(path, modelValue)
+				if !resolved.OK {
+					return rejectModelRoute(ctx, resolved.ErrorCode, resolved.ErrorMessage)
+				}
+				applyResolvedHeaders(config, resolved.Entry)
+				if !config.keepOriginalModelName {
+					partContent = []byte(resolved.Entry.UpstreamModel)
+					modified = true
+				}
+			} else if config.modelToHeader != "" {
 				_ = proxywasm.ReplaceHttpRequestHeader(config.modelToHeader, modelValue)
 			}
 
-			if config.addProviderHeader != "" {
+			if (config.registry == nil || !config.registry.Enabled) && config.addProviderHeader != "" {
 				parts := strings.SplitN(modelValue, "/", 2)
 				if len(parts) == 2 {
 					provider := parts[0]
@@ -375,4 +433,94 @@ func handleMultipartBody(ctx wrapper.HttpContext, config ModelRouterConfig, body
 	}
 
 	return types.ActionContinue
+}
+
+func applyPublishedModelRoute(ctx wrapper.HttpContext, config ModelRouterConfig, body []byte, modelValue string) types.Action {
+	path, _ := proxywasm.GetHttpRequestHeader(":path")
+	resolved := config.registry.Resolve(path, modelValue)
+	if !resolved.OK {
+		return rejectModelRoute(ctx, resolved.ErrorCode, resolved.ErrorMessage)
+	}
+	// This plugin runs ahead of key-auth in the AUTHN phase (priority 900
+	// against key-auth's 310), because the route a request lands on is the one
+	// this plugin selects and key-auth's allow list is per-route. That ordering
+	// means `x-mse-consumer` is set only when some earlier filter already
+	// authenticated the caller. Enforcing model authorization against an absent
+	// consumer would reject every request, so the check applies only when the
+	// caller is already known; the same registry is published to ai-credits,
+	// which runs after authentication and refuses an unauthorized model there.
+	if consumer, _ := proxywasm.GetHttpRequestHeader("x-mse-consumer"); strings.TrimSpace(consumer) != "" {
+		if ok, code, message := config.registry.Authorize(consumer, resolved.Entry.CanonicalID); !ok {
+			return rejectModelRoute(ctx, code, message)
+		}
+	}
+	applyResolvedHeaders(config, resolved.Entry)
+	if !config.keepOriginalModelName && resolved.Entry.UpstreamModel != modelValue {
+		newBody, err := sjson.SetBytes(body, config.modelKey, resolved.Entry.UpstreamModel)
+		if err != nil {
+			log.Errorf("failed to update model in published json body: %v", err)
+			return rejectModelRoute(ctx, errUnknownModel, "failed to apply published model mapping")
+		}
+		_ = proxywasm.ReplaceHttpRequestBody(newBody)
+	}
+	_ = proxywasm.ReplaceHttpRequestHeader("x-ai-credits-canonical-model", resolved.Entry.CanonicalID)
+	return types.ActionContinue
+}
+
+func applyResolvedHeaders(config ModelRouterConfig, entry *ModelEntry) {
+	routeHeader := config.modelToHeader
+	if routeHeader == "" {
+		routeHeader = "x-higress-llm-model"
+	}
+	_ = proxywasm.ReplaceHttpRequestHeader(routeHeader, entry.RouteValue)
+	if config.addProviderHeader != "" {
+		provider := entry.ProviderValue
+		if provider == "" {
+			provider = entry.GroupKey
+		}
+		_ = proxywasm.ReplaceHttpRequestHeader(config.addProviderHeader, provider)
+	}
+}
+
+func rejectModelRoute(ctx wrapper.HttpContext, code, message string) types.Action {
+	path, _ := proxywasm.GetHttpRequestHeader(":path")
+	status := uint32(400)
+	switch code {
+	case errUnknownModel, errUnknownGroup:
+		status = 404
+	case errUnauthenticated:
+		status = 401
+	case errUnauthorizedModel:
+		status = 403
+	case errRegistryUnavailable:
+		status = 503
+	case errUnsupportedEndpoint:
+		status = 400
+	case errPrefixConflict, errAmbiguousModel, errMissingModel:
+		status = 400
+	}
+	var payload []byte
+	if protocolErrorType(path) == "anthropic" {
+		payload, _ = json.Marshal(map[string]interface{}{
+			"type": "error",
+			"error": map[string]string{
+				"type":    "invalid_request_error",
+				"message": message,
+				"code":    code,
+			},
+		})
+	} else {
+		payload, _ = json.Marshal(map[string]interface{}{
+			"error": map[string]string{
+				"message": message,
+				"type":    "invalid_request_error",
+				"code":    code,
+			},
+		})
+	}
+	headers := [][2]string{{"content-type", "application/json; charset=utf-8"}}
+	if err := proxywasm.SendHttpResponseWithDetail(status, "model-router."+code, headers, payload, -1); err != nil {
+		log.Errorf("failed to send model-router error: %v", err)
+	}
+	return types.ActionPause
 }
