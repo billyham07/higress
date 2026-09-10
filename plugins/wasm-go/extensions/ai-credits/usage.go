@@ -5,6 +5,7 @@ import (
 
 	"github.com/higress-group/wasm-go/pkg/tokenusage"
 	"github.com/higress-group/wasm-go/pkg/wrapper"
+	"github.com/tidwall/gjson"
 )
 
 const (
@@ -137,14 +138,27 @@ func normalizeTokenUsage(usage tokenusage.TokenUsage, usageObjectPresent bool) U
 	}
 }
 
+// usageObjectPresent reports whether this chunk carries a usage object.
+//
+// An explicit JSON null is not one. OpenAI Responses opens every stream with
+// response.created / response.in_progress carrying "usage": null, and gjson
+// says a null field exists. Counting that as evidence meant a Responses stream
+// that died before any real usage was settled as COMPLETE at zero credits: the
+// call was free and the row was closed, so neither the recovery window nor an
+// operator would ever revisit it. A legitimate zero-token usage object is an
+// object with zero counters, which still reads as present here.
 func usageObjectPresent(data []byte) bool {
-	return wrapper.GetValueFromBody(data, []string{"usage"}) != nil ||
-		wrapper.GetValueFromBody(data, []string{"message.usage"}) != nil ||
-		// OpenAI Responses streaming events carry the final usage under the
-		// response object (response.completed). Keep this separate from the
-		// semantic terminal check: usage alone is still only evidence until
-		// response.completed or transport EOF arrives.
-		wrapper.GetValueFromBody(data, []string{"response.usage"}) != nil
+	// OpenAI Responses streaming events carry the final usage under the
+	// response object (response.completed). Keep this separate from the
+	// semantic terminal check: usage alone is still only evidence until
+	// response.completed or transport EOF arrives.
+	for _, path := range []string{"usage", "message.usage", "response.usage"} {
+		value := wrapper.GetValueFromBody(data, []string{path})
+		if value != nil && value.Type != gjson.Null {
+			return true
+		}
+	}
+	return false
 }
 
 func openAIInputIncludesCache(details map[string]int64) bool {

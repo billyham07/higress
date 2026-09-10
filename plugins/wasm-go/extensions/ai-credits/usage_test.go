@@ -75,6 +75,41 @@ func TestResponsesUsageObjectIsRecognizedInsideResponse(t *testing.T) {
 	require.False(t, usageObjectPresent([]byte(`data: {"type":"response.completed","response":{"status":"completed"}}`)))
 }
 
+// OpenAI Responses opens every stream with response.created and
+// response.in_progress carrying "usage": null, and gjson reports a null field
+// as existing. Treating that as usage evidence made a Responses stream that
+// died before any real usage settle as COMPLETE at zero credits -- the call was
+// free and the row was closed, so neither the recovery window nor an operator
+// would revisit it. Observed on higress-system-test against a real qwen3.5
+// upstream: /v1/responses stream=true returned 200, emitted only
+// response.created and response.in_progress, and settled 0 micros complete.
+func TestResponsesNullUsageIsNotEvidence(t *testing.T) {
+	created := []byte(`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress","usage":null}}`)
+	inProgress := []byte(`data: {"type":"response.in_progress","response":{"id":"resp_1","status":"in_progress","usage":null}}`)
+	require.False(t, usageObjectPresent(created))
+	require.False(t, usageObjectPresent(inProgress))
+
+	// A chat-completions chunk with an explicit null usage is the same case.
+	require.False(t, usageObjectPresent([]byte(`data: {"choices":[{"delta":{"content":"hi"}}],"usage":null}`)))
+	// Anthropic's message envelope likewise.
+	require.False(t, usageObjectPresent([]byte(`data: {"type":"message_start","message":{"usage":null}}`)))
+
+	// A real usage object still counts, including a legitimate all-zero one.
+	require.True(t, usageObjectPresent([]byte(`data: {"choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`)))
+	require.True(t, usageObjectPresent([]byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":2}}}`)))
+}
+
+// The end state the null above produced: a stream that carried no usage must
+// reach the ledger as pending_verify, not as a settled zero charge.
+func TestStreamWithOnlyNullUsageSettlesAsPendingVerify(t *testing.T) {
+	created := []byte(`data: {"type":"response.created","response":{"id":"resp_1","usage":null}}`)
+	seen := usageObjectPresent(created)
+	require.False(t, seen)
+	status, reason := settleReason(true, false, UsagePayload{Complete: seen}, 200)
+	require.Equal(t, SettlePendingVerify, status)
+	require.Equal(t, ReasonMissingUsage, reason)
+}
+
 func TestSettleReasonMissingUsageIsPending(t *testing.T) {
 	status, reason := settleReason(true, false, UsagePayload{Complete: false}, 200)
 	require.Equal(t, SettlePendingVerify, status)
