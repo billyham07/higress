@@ -807,6 +807,191 @@ func TestClaudeToOpenAIConverter_ConvertClaudeRequestToOpenAI(t *testing.T) {
 		assert.Equal(t, "toolu_vrtx_01UbCfwoTgoDBqbYEwkVaxd5", toolMsg.ToolCallId)
 	})
 
+	t.Run("tool_result_image_reaches_the_model", func(t *testing.T) {
+		// A tool that returns a screenshot puts the image inside
+		// tool_result.content. OpenAI's tool role carries a plain string, so the
+		// conversion used to concatenate the text blocks and drop the image: the
+		// upstream answered about a picture it never received. Observed in
+		// production against glm-5.3-flash, where the same image sent as
+		// user.content was recognised and the same image sent as a tool result
+		// was not (input tokens fell from 353 to 75).
+		claudeRequest := `{
+			"model": "anthropic/claude-sonnet-4",
+			"messages": [{
+				"role": "user",
+				"content": [{
+					"type": "tool_result",
+					"tool_use_id": "toolu_read_1",
+					"content": [
+						{"type": "text", "text": "Read image test.png"},
+						{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+					]
+				}]
+			}],
+			"max_tokens": 1000
+		}`
+
+		result, err := converter.ConvertClaudeRequestToOpenAI([]byte(claudeRequest))
+		require.NoError(t, err)
+
+		var openaiRequest chatCompletionRequest
+		err = json.Unmarshal(result, &openaiRequest)
+		require.NoError(t, err)
+
+		// The tool message keeps the text and the correlation to its call.
+		require.Len(t, openaiRequest.Messages, 2)
+		toolMsg := openaiRequest.Messages[0]
+		assert.Equal(t, "tool", toolMsg.Role)
+		assert.Equal(t, "Read image test.png", toolMsg.Content)
+		assert.Equal(t, "toolu_read_1", toolMsg.ToolCallId)
+
+		// The image rides in the companion user message, which is the shape the
+		// OpenAI-native clients produce for the same conversation.
+		companion := openaiRequest.Messages[1]
+		assert.Equal(t, "user", companion.Role)
+		parts := companionContents(t, companion)
+		require.Len(t, parts, 2)
+		assert.Equal(t, contentTypeText, parts[0].Type)
+		assert.Contains(t, parts[0].Text, "toolu_read_1")
+		assert.Equal(t, contentTypeImageUrl, parts[1].Type)
+		require.NotNil(t, parts[1].ImageUrl)
+		assert.Equal(t, "data:image/png;base64,iVBORw0KGgo=", parts[1].ImageUrl.Url)
+	})
+
+	t.Run("image_only_tool_result_keeps_a_non_empty_tool_message", func(t *testing.T) {
+		// A screenshot tool returns no text at all. The tool message still has to
+		// carry something: strict OpenAI-compatible providers reject a tool turn
+		// with empty content.
+		claudeRequest := `{
+			"model": "anthropic/claude-sonnet-4",
+			"messages": [{
+				"role": "user",
+				"content": [{
+					"type": "tool_result",
+					"tool_use_id": "toolu_shot_1",
+					"content": [
+						{"type": "image", "source": {"type": "url", "url": "https://example.invalid/shot.png"}}
+					]
+				}]
+			}],
+			"max_tokens": 1000
+		}`
+
+		result, err := converter.ConvertClaudeRequestToOpenAI([]byte(claudeRequest))
+		require.NoError(t, err)
+
+		var openaiRequest chatCompletionRequest
+		err = json.Unmarshal(result, &openaiRequest)
+		require.NoError(t, err)
+
+		require.Len(t, openaiRequest.Messages, 2)
+		toolMsg := openaiRequest.Messages[0]
+		assert.Equal(t, "tool", toolMsg.Role)
+		assert.NotEmpty(t, toolMsg.Content)
+		assert.Equal(t, "toolu_shot_1", toolMsg.ToolCallId)
+
+		parts := companionContents(t, openaiRequest.Messages[1])
+		require.Len(t, parts, 2)
+		assert.Equal(t, contentTypeImageUrl, parts[1].Type)
+		require.NotNil(t, parts[1].ImageUrl)
+		assert.Equal(t, "https://example.invalid/shot.png", parts[1].ImageUrl.Url)
+	})
+
+	t.Run("several_tool_results_keep_their_images_labelled_and_in_order", func(t *testing.T) {
+		// One assistant turn can answer several tool calls. Each image has to stay
+		// identifiable, or the model attributes the wrong picture to the wrong call.
+		claudeRequest := `{
+			"model": "anthropic/claude-sonnet-4",
+			"messages": [{
+				"role": "user",
+				"content": [
+					{"type": "tool_result", "tool_use_id": "toolu_a",
+					 "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}]},
+					{"type": "tool_result", "tool_use_id": "toolu_b",
+					 "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "BBBB"}}]}
+				]
+			}],
+			"max_tokens": 1000
+		}`
+
+		result, err := converter.ConvertClaudeRequestToOpenAI([]byte(claudeRequest))
+		require.NoError(t, err)
+
+		var openaiRequest chatCompletionRequest
+		err = json.Unmarshal(result, &openaiRequest)
+		require.NoError(t, err)
+
+		require.Len(t, openaiRequest.Messages, 3)
+		assert.Equal(t, "toolu_a", openaiRequest.Messages[0].ToolCallId)
+		assert.Equal(t, "toolu_b", openaiRequest.Messages[1].ToolCallId)
+
+		parts := companionContents(t, openaiRequest.Messages[2])
+		require.Len(t, parts, 4)
+		assert.Contains(t, parts[0].Text, "toolu_a")
+		assert.Equal(t, "data:image/png;base64,AAAA", parts[1].ImageUrl.Url)
+		assert.Contains(t, parts[2].Text, "toolu_b")
+		assert.Equal(t, "data:image/jpeg;base64,BBBB", parts[3].ImageUrl.Url)
+	})
+
+	t.Run("image_beside_a_tool_result_is_not_dropped", func(t *testing.T) {
+		// An image can sit next to the tool_result in the same Claude turn rather
+		// than inside it. That branch only emitted the text parts, so the sibling
+		// image was lost as well.
+		claudeRequest := `{
+			"model": "anthropic/claude-sonnet-4",
+			"messages": [{
+				"role": "user",
+				"content": [
+					{"type": "tool_result", "tool_use_id": "toolu_c", "content": [{"type": "text", "text": "done"}]},
+					{"type": "text", "text": "compare it with this"},
+					{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "CCCC"}}
+				]
+			}],
+			"max_tokens": 1000
+		}`
+
+		result, err := converter.ConvertClaudeRequestToOpenAI([]byte(claudeRequest))
+		require.NoError(t, err)
+
+		var openaiRequest chatCompletionRequest
+		err = json.Unmarshal(result, &openaiRequest)
+		require.NoError(t, err)
+
+		require.Len(t, openaiRequest.Messages, 2)
+		assert.Equal(t, "done", openaiRequest.Messages[0].Content)
+
+		parts := companionContents(t, openaiRequest.Messages[1])
+		require.Len(t, parts, 2)
+		assert.Equal(t, "compare it with this", parts[0].Text)
+		assert.Equal(t, "data:image/png;base64,CCCC", parts[1].ImageUrl.Url)
+	})
+
+	t.Run("text_only_tool_result_companion_keeps_the_plain_string_shape", func(t *testing.T) {
+		// No images anywhere: the companion message must stay a plain string, the
+		// shape every provider accepts and the one this converter already emitted.
+		claudeRequest := `{
+			"model": "anthropic/claude-sonnet-4",
+			"messages": [{
+				"role": "user",
+				"content": [
+					{"type": "tool_result", "tool_use_id": "toolu_d", "content": [{"type": "text", "text": "ok"}]},
+					{"type": "text", "text": "and then?"}
+				]
+			}],
+			"max_tokens": 1000
+		}`
+
+		result, err := converter.ConvertClaudeRequestToOpenAI([]byte(claudeRequest))
+		require.NoError(t, err)
+
+		var openaiRequest chatCompletionRequest
+		err = json.Unmarshal(result, &openaiRequest)
+		require.NoError(t, err)
+
+		require.Len(t, openaiRequest.Messages, 2)
+		assert.Equal(t, "and then?", openaiRequest.Messages[1].Content)
+	})
+
 	t.Run("convert_tool_result_with_actual_error_data", func(t *testing.T) {
 		// Test using the actual JSON data from the error log to ensure our fix works
 		// This tests the fix for issue #3344 - text content alongside tool_result should be preserved
@@ -1770,4 +1955,16 @@ func parseClaudeSSEEvents(t *testing.T, raw []byte) []parsedClaudeSSEEvent {
 
 func stringPtr(value string) *string {
 	return &value
+}
+
+// companionContents reads the companion user message's multimodal parts. The
+// request is round-tripped through JSON in these tests, so the content arrives
+// as []any rather than as the typed slice the converter built.
+func companionContents(t *testing.T, message chatMessage) []chatMessageContent {
+	t.Helper()
+	encoded, err := json.Marshal(message.Content)
+	require.NoError(t, err)
+	var parts []chatMessageContent
+	require.NoError(t, json.Unmarshal(encoded, &parts))
+	return parts
 }

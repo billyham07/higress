@@ -218,22 +218,59 @@ func (c *ClaudeToOpenAIConverter) ConvertClaudeRequestToOpenAIWithOptions(body [
 
 			// Handle tool results if present
 			if len(conversionResult.toolResults) > 0 {
+				// Images travel separately from the tool messages. OpenAI's tool
+				// role carries a plain string, so an image returned by a tool has
+				// no place in it; the OpenAI-native clients put it in the user
+				// message that follows, and so do we. The label keeps a result
+				// tied to the call it answers when a turn holds several.
+				var liftedImages []chatMessageContent
 				for _, toolResult := range conversionResult.toolResults {
+					text := toolResultText(toolResult)
+					if images := toolResultImages(toolResult); len(images) > 0 {
+						liftedImages = append(liftedImages, chatMessageContent{
+							Type: contentTypeText,
+							Text: fmt.Sprintf("Image output of tool_use_id %s:", toolResult.ToolUseId),
+						})
+						liftedImages = append(liftedImages, images...)
+						if text == "" {
+							// A tool that returned only an image still needs a
+							// non-empty tool message: strict providers reject a
+							// tool turn with no content.
+							text = fmt.Sprintf("[image output; see the image for tool_use_id %s in the following message]", toolResult.ToolUseId)
+						}
+					}
 					toolMsg := chatMessage{
 						Role:                "tool",
-						Content:             toolResult.Content.GetStringValue(),
+						Content:             text,
 						ToolCallId:          toolResult.ToolUseId,
 						ClaudeContentBlocks: []claudeChatMessageContent{toolResult},
 					}
 					openaiRequest.Messages = append(openaiRequest.Messages, toolMsg)
 				}
-				// Also add visible text content if present alongside tool results.
-				// This companion message intentionally does not carry reasoning_content:
-				// tool_result content is user/tool-side data, while thinking belongs to assistant turns.
+
+				// Companion message for everything the tool messages could not
+				// carry: visible text beside the tool results, images sitting
+				// beside them in the same Claude turn, and the images lifted out
+				// of the tool results above. It intentionally does not carry
+				// reasoning_content: tool_result content is user/tool-side data,
+				// while thinking belongs to assistant turns.
+				var companion []chatMessageContent
 				if len(conversionResult.textParts) > 0 {
-					textMsg := chatMessage{
-						Role:    claudeMsg.Role,
-						Content: strings.Join(conversionResult.textParts, "\n\n"),
+					companion = append(companion, chatMessageContent{
+						Type: contentTypeText,
+						Text: strings.Join(conversionResult.textParts, "\n\n"),
+					})
+				}
+				companion = append(companion, imageContentsOnly(conversionResult.openaiContents)...)
+				companion = append(companion, liftedImages...)
+				if len(companion) > 0 {
+					textMsg := chatMessage{Role: claudeMsg.Role}
+					if len(companion) == 1 && companion[0].Type == contentTypeText {
+						// Text-only companions keep the plain-string shape every
+						// provider accepts.
+						textMsg.Content = companion[0].Text
+					} else {
+						textMsg.Content = companion
 					}
 					openaiRequest.Messages = append(openaiRequest.Messages, textMsg)
 				}
@@ -1060,6 +1097,70 @@ func openAIFinishReasonToClaude(reason string) string {
 	}
 }
 
+// claudeImageContent converts one Claude image block to an OpenAI image part.
+// It reports false for anything that is not a usable image, so callers can walk
+// mixed content without repeating the source-shape checks.
+func claudeImageContent(block claudeChatMessageContent) (chatMessageContent, bool) {
+	if block.Type != "image" || block.Source == nil {
+		return chatMessageContent{}, false
+	}
+	switch block.Source.Type {
+	case "base64":
+		return chatMessageContent{
+			Type: contentTypeImageUrl,
+			ImageUrl: &chatMessageContentImageUrl{
+				Url: fmt.Sprintf("data:%s;base64,%s", block.Source.MediaType, block.Source.Data),
+			},
+		}, true
+	case "url":
+		return chatMessageContent{
+			Type:     contentTypeImageUrl,
+			ImageUrl: &chatMessageContentImageUrl{Url: block.Source.Url},
+		}, true
+	}
+	return chatMessageContent{}, false
+}
+
+// toolResultImages pulls the images out of one tool_result's content.
+//
+// A tool that returns a screenshot puts the image inside tool_result.content,
+// and OpenAI's tool role takes a plain string -- there is nowhere in that
+// message for an image to go. Dropping it silently is what made a vision model
+// answer about a picture it never received, so the images are lifted out here
+// and re-attached to the companion user message instead.
+func toolResultImages(toolResult claudeChatMessageContent) []chatMessageContent {
+	if toolResult.Content == nil || toolResult.Content.IsString {
+		return nil
+	}
+	var images []chatMessageContent
+	for _, block := range toolResult.Content.ArrayValue {
+		if image, ok := claudeImageContent(block); ok {
+			images = append(images, image)
+		}
+	}
+	return images
+}
+
+// toolResultText is the text half of a tool_result, guarding the nil content a
+// caller is allowed to send.
+func toolResultText(toolResult claudeChatMessageContent) string {
+	if toolResult.Content == nil {
+		return ""
+	}
+	return toolResult.Content.GetStringValue()
+}
+
+// imageContentsOnly keeps just the image parts of an already-converted array.
+func imageContentsOnly(contents []chatMessageContent) []chatMessageContent {
+	var images []chatMessageContent
+	for _, content := range contents {
+		if content.Type == contentTypeImageUrl {
+			images = append(images, content)
+		}
+	}
+	return images
+}
+
 // convertContentArray converts an array of Claude content to OpenAI content format
 func (c *ClaudeToOpenAIConverter) convertContentArray(claudeContents []claudeChatMessageContent) *contentConversionResult {
 	result := &contentConversionResult{
@@ -1099,24 +1200,8 @@ func (c *ClaudeToOpenAIConverter) convertContentArray(claudeContents []claudeCha
 			preserveClaudeContentBlocks = true
 			// data is an opaque Claude blob, not portable reasoning text.
 		case "image":
-			if claudeContent.Source != nil {
-				if claudeContent.Source.Type == "base64" {
-					// Convert base64 image to OpenAI format
-					dataUrl := fmt.Sprintf("data:%s;base64,%s", claudeContent.Source.MediaType, claudeContent.Source.Data)
-					result.openaiContents = append(result.openaiContents, chatMessageContent{
-						Type: contentTypeImageUrl,
-						ImageUrl: &chatMessageContentImageUrl{
-							Url: dataUrl,
-						},
-					})
-				} else if claudeContent.Source.Type == "url" {
-					result.openaiContents = append(result.openaiContents, chatMessageContent{
-						Type: contentTypeImageUrl,
-						ImageUrl: &chatMessageContentImageUrl{
-							Url: claudeContent.Source.Url,
-						},
-					})
-				}
+			if image, ok := claudeImageContent(claudeContent); ok {
+				result.openaiContents = append(result.openaiContents, image)
 			}
 		case "tool_use":
 			preserveClaudeContentBlocks = true
