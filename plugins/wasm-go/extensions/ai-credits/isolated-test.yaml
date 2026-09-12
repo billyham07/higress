@@ -1,0 +1,97 @@
+# Minimum isolated-gateway load config for the environment Pi.
+# Artifacts (gitignored wasm):
+#   higress/plugins/wasm-go/extensions/ai-credits/main.wasm
+#   higress/plugins/wasm-go/extensions/model-router/main.wasm
+#   higress/plugins/wasm-go/extensions/ai-model-catalog/main.wasm
+# Rebuild:
+#   cd higress/plugins/wasm-go/extensions/<name>
+#   GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o ./main.wasm .
+# Do not apply this to production higress-system.
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: model-router
+spec:
+  url: file:///opt/plugins/model-router/plugin.wasm
+  defaultConfig:
+    modelKey: model
+    modelToHeader: x-higress-llm-model
+    enableOnPathSuffix: ["/completions", "/messages", "/responses"]
+    registry:
+      version: unified-model.v1
+      defaultGroupKey: h20
+      models:
+        - canonicalId: h20/qwen3.5
+          groupKey: h20
+          publicId: h20/qwen3.5
+          upstreamModel: qwen3.5
+          aliases: ["qwen3.5"]
+          routeValue: qwen3.5
+          capabilities:
+            openai.chat.completions: true
+            anthropic.messages: true
+        - canonicalId: bailian/glm-5.2
+          groupKey: bailian
+          publicId: bailian/glm-5.2
+          upstreamModel: glm-5.2
+          aliases: ["glm-5.2"]
+          routeValue: glm-5.2
+          capabilities:
+            openai.chat.completions: true
+            anthropic.messages: false
+---
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: ai-model-catalog
+spec:
+  url: file:///opt/plugins/ai-model-catalog/plugin.wasm
+  defaultConfigDisable: true
+  matchRules:
+    - ingress: [ai-models-catalog]
+      config:
+        created: 1700000000
+        models:
+          - id: h20/qwen3.5
+            ownedBy: higress-private
+            aliases: ["qwen3.5"]
+          - id: bailian/glm-5.2
+            ownedBy: higress-private
+            aliases: ["glm-5.2"]
+        consumers:
+          u-alice: ["h20/qwen3.5", "bailian/glm-5.2"]
+---
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: ai-credits
+spec:
+  url: file:///opt/plugins/ai-credits/plugin.wasm
+  priority: 270
+  failStrategy: FAIL_CLOSE
+  defaultConfig:
+    mode: enforce
+    serviceKey: isolated-test-service-key
+    admitPath: /internal/ai-credits/v1/admit
+    settlePath: /internal/ai-credits/v1/settle
+    # Replace with an isolated backend FQDN. Do not point this file at higress-system.
+    service:
+      name: isolated-ai-credits.static
+      port: 80
+    registry:
+      version: unified-model.v1
+      defaultGroupKey: h20
+      models:
+        - canonicalId: h20/qwen3.5
+          groupKey: h20
+          upstreamModel: qwen3.5
+          aliases: ["qwen3.5"]
+          capabilities:
+            openai.chat.completions: true
+            anthropic.messages: true
+        - canonicalId: bailian/glm-5.2
+          groupKey: bailian
+          upstreamModel: glm-5.2
+          aliases: ["glm-5.2"]
+          capabilities:
+            openai.chat.completions: true

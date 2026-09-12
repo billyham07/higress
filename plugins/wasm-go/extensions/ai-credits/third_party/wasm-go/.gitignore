@@ -1,0 +1,13 @@
+out
+*.out
+*.tgz
+*.wasm
+.DS_Store
+coverage.xml
+.design/
+.idea/
+.vscode/
+.cursor/
+.specify/
+.pr/
+specs/
