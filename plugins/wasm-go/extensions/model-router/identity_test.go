@@ -234,3 +234,53 @@ func TestResolveRefusesAnotherGroupFromTheRootPath(t *testing.T) {
 	require.Contains(t, got.ErrorMessage, "bailian")
 	require.Nil(t, got.Entry, "a refused resolution must not carry an entry to route on")
 }
+
+// The root entry may answer an unrecognised name with one named model, because
+// the route it replaces forwards any name to a single upstream and callers have
+// been sending names of their own for as long as it has existed. A group entry
+// may not: answering there with another group's model is the silent
+// substitution this registry exists to stop.
+func TestOnlyTheRootEntryFallsBackForAnUnknownName(t *testing.T) {
+	cfg := `{"registry":{"enable":true,"version":"unified-model.v1","defaultGroupKey":"h20",
+	 "unknownModelFallback":"h20/deepseek-v4-flash",
+	 "models":[
+	  {"id":"h20/deepseek-v4-flash","canonicalId":"h20/deepseek-v4-flash","groupKey":"h20","routeValue":"deepseek-v4-flash","capabilities":{"openai.chat.completions":true}},
+	  {"id":"bailian/qwen-max","canonicalId":"bailian/qwen-max","groupKey":"bailian","routeValue":"qwen-max","capabilities":{"openai.chat.completions":true}}
+	 ]}}`
+	reg, err := parseRegistry(gjson.Parse(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Root path, a name nobody published: served by the fallback, and said so.
+	got := reg.Resolve("/v1/chat/completions", "something-nobody-published")
+	if got.ErrorCode != "" {
+		t.Fatalf("the root entry refused a name it is required to serve: %+v", got)
+	}
+	if got.Entry == nil || got.Entry.CanonicalID != "h20/deepseek-v4-flash" {
+		t.Fatalf("resolved to %+v, want the root entry's fallback", got.Entry)
+	}
+	if !got.FellBack {
+		t.Fatal("the request was served by something other than what it asked for, and the result does not say so")
+	}
+
+	// A name that does resolve is untouched by the fallback.
+	got = reg.Resolve("/v1/chat/completions", "deepseek-v4-flash")
+	if got.ErrorCode != "" || got.FellBack {
+		t.Fatalf("a resolvable name went through the fallback: %+v", got)
+	}
+
+	// A group entry refuses, as it does with no fallback configured at all.
+	got = reg.Resolve("/bailian/v1/chat/completions", "something-nobody-published")
+	if got.ErrorCode == "" {
+		t.Fatalf("a group entry served an unknown name: %+v", got)
+	}
+
+	// And a fallback naming a model this release does not carry resolves
+	// nothing rather than becoming a pass.
+	reg.UnknownModelFallback = "h20/not-published"
+	got = reg.Resolve("/v1/chat/completions", "something-nobody-published")
+	if got.ErrorCode == "" {
+		t.Fatalf("a fallback pointing at nothing became a pass: %+v", got)
+	}
+}

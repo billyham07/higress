@@ -65,7 +65,19 @@ type Registry struct {
 	Version          string
 	ConfigVersion    string
 	DefaultGroupKey  string
-	StripHeaders     []string
+	// UnknownModelFallback is the canonical model the ROOT entry serves when
+	// the requested name resolves to nothing.
+	//
+	// Only the root entry: a group entry is addressed by its own prefix, and
+	// answering an unrecognised name there with another group's model is the
+	// silent substitution this registry exists to stop. The root entry is
+	// different because the route it replaces already behaves this way -- it
+	// forwards any name to one upstream -- and callers have been sending names
+	// of their own for as long as it has existed.
+	//
+	// Empty refuses, which is the rule everywhere it is not set.
+	UnknownModelFallback string
+	StripHeaders         []string
 	byCanonical      map[string]*ModelEntry
 	byGroupModel     map[string]*ModelEntry
 	Groups           map[string]struct{}
@@ -82,6 +94,10 @@ type ResolveResult struct {
 	Endpoint       string
 	ErrorCode      string
 	ErrorMessage   string
+	// FellBack says the name did not resolve and the root entry's fallback
+	// model answered instead. It travels so the log and the admission record
+	// say the request was served by something other than what it asked for.
+	FellBack bool
 }
 
 func parseRegistry(json gjson.Result) (*Registry, error) {
@@ -118,6 +134,9 @@ func parseRegistry(json gjson.Result) (*Registry, error) {
 		return reg, nil
 	}
 	reg.ConfigVersion = strings.TrimSpace(node.Get("configVersion").String())
+	if f := strings.TrimSpace(node.Get("unknownModelFallback").String()); f != "" {
+		reg.UnknownModelFallback = f
+	}
 	if g := strings.TrimSpace(node.Get("defaultGroupKey").String()); g != "" {
 		reg.DefaultGroupKey = g
 	}
@@ -378,6 +397,21 @@ func (reg *Registry) Resolve(path, requestedModel string) ResolveResult {
 	}
 	if entry := reg.lookup(group, result.RequestedModel); entry != nil {
 		return reg.finish(result, entry)
+	}
+	// The root entry may answer an unrecognised name with one named model. The
+	// route it replaces forwards any name to a single upstream, and callers
+	// have been sending names of their own for as long as it has existed; the
+	// entry says so explicitly rather than the registry guessing it.
+	//
+	// pathGroup must be empty: a group entry is addressed by its own prefix,
+	// and serving another model there is the substitution this refuses
+	// everywhere else. The fallback is resolved as a model, so the caller must
+	// still be authorized for it and is charged for it.
+	if pathGroup == "" && reg.UnknownModelFallback != "" {
+		if entry := reg.byCanonical[reg.UnknownModelFallback]; entry != nil {
+			result.FellBack = true
+			return reg.finish(result, entry)
+		}
 	}
 	result.ErrorCode = errUnknownModel
 	result.ErrorMessage = fmt.Sprintf("unknown model %q", result.RequestedModel)
