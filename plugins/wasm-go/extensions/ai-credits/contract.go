@@ -46,6 +46,7 @@ type AdmitRequest struct {
 	AttemptID            string `json:"attemptId"`
 	Consumer             string `json:"consumer"`
 	EntryPath            string `json:"entryPath"`
+	EntryAuthority       string `json:"entryAuthority,omitempty"`
 	EntryProtocol        string `json:"entryProtocol"`
 	Endpoint             string `json:"endpoint"`
 	RequestedModel       string `json:"requestedModel"`

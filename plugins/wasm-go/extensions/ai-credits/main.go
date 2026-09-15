@@ -159,12 +159,14 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config CreditsConfig, body []byt
 		log.Warnf("ai-credits shadow unbounded input: %s", bound.Reason)
 	}
 
+	authority, _ := proxywasm.GetHttpRequestHeader(":authority")
 	req := AdmitRequest{
 		ContractVersion:      CreditsContractVersion,
 		RequestID:            stringFromCtx(ctx, ctxRequestID),
 		AttemptID:            stringFromCtx(ctx, ctxAttemptID),
 		Consumer:             consumer,
 		EntryPath:            path,
+		EntryAuthority:       authority,
 		EntryProtocol:        protocolErrorType(path),
 		Endpoint:             endpoint,
 		RequestedModel:       modelValue,
