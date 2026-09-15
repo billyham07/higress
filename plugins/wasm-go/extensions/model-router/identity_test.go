@@ -284,3 +284,57 @@ func TestOnlyTheRootEntryFallsBackForAnUnknownName(t *testing.T) {
 		t.Fatalf("a fallback pointing at nothing became a pass: %+v", got)
 	}
 }
+
+// TestTheFallbackWithholdsItselfFromPathsNoEntryClaims covers the bailian-gc
+// shape: an entry whose prefix is deeper than /<group>/v1. The plugin used to
+// resolve the group from the first path segment and gave up on anything else,
+// so such a path fell into the root group -- and once the root fallback
+// existed, a request on one group's route was answered by another group's
+// fallback model. The published prefixes make the path resolvable, and the
+// fallback withholds itself from a path it cannot place.
+func TestTheFallbackWithholdsItselfFromPathsNoEntryClaims(t *testing.T) {
+	cfg := `{"registry":{"enable":true,"version":"unified-model.v1","defaultGroupKey":"h20",
+	 "unknownModelFallback":"h20/deepseek-v4-flash",
+	 "rootPathPrefixes":["/v1"],
+	 "groupPaths":{"bailian-gc":["/bailian/multimodal-generation"],"bailian":["/bailian/v1"]},
+	 "models":[
+	  {"id":"h20/deepseek-v4-flash","canonicalId":"h20/deepseek-v4-flash","groupKey":"h20","routeValue":"deepseek-v4-flash","capabilities":{"openai.chat.completions":true}},
+	  {"id":"bailian-gc/qwen-image-2.0","canonicalId":"bailian-gc/qwen-image-2.0","groupKey":"bailian-gc","routeValue":"qwen-image-2.0","capabilities":{"openai.chat.completions":true}}
+	 ]}}`
+	reg, err := parseRegistry(gjson.Parse(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A real model on the deep-prefix entry resolves in its own group, not in
+	// the root group it used to fall into.
+	got := reg.Resolve("/bailian/multimodal-generation/v1/chat/completions", "qwen-image-2.0")
+	if got.ErrorCode != "" {
+		t.Fatalf("the deep-prefix entry refused its own model: %+v", got)
+	}
+	if got.Entry == nil || got.Entry.CanonicalID != "bailian-gc/qwen-image-2.0" {
+		t.Fatalf("resolved to %+v, want the bailian-gc model", got.Entry)
+	}
+	if got.FellBack {
+		t.Fatalf("the request was served by the fallback: %+v", got)
+	}
+
+	// An unknown name there is refused, not answered by the root fallback.
+	got = reg.Resolve("/bailian/multimodal-generation/v1/chat/completions", "something-nobody-published")
+	if got.ErrorCode == "" || got.FellBack {
+		t.Fatalf("an unknown name on a group entry was served by the root fallback: %+v", got)
+	}
+
+	// The root path keeps serving the fallback.
+	got = reg.Resolve("/v1/chat/completions", "something-nobody-published")
+	if got.ErrorCode != "" || !got.FellBack {
+		t.Fatalf("the root path lost its fallback: %+v", got)
+	}
+
+	// And the compatibility path -- the bare root the no-host route answered
+	// on -- is a root path too.
+	got = reg.Resolve("/", "something-nobody-published")
+	if got.ErrorCode != "" || !got.FellBack {
+		t.Fatalf("the bare compatibility path lost its fallback: %+v", got)
+	}
+}

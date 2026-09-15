@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/tidwall/gjson"
@@ -77,7 +78,15 @@ type Registry struct {
 	//
 	// Empty refuses, which is the rule everywhere it is not set.
 	UnknownModelFallback string
-	StripHeaders         []string
+	// GroupPathPrefixes and RootPathPrefixes are where this release's entries
+	// actually serve. The path a request arrives on decides which group's
+	// names resolve against, and guessing that from the first path segment
+	// broke on the first entry whose prefix is deeper than /<group>/v1 -- the
+	// request fell into the root group, where the name resolves to nothing.
+	// The prefixes are published facts, matched longest first.
+	GroupPathPrefixes map[string][]string
+	RootPathPrefixes  []string
+	StripHeaders      []string
 	byCanonical      map[string]*ModelEntry
 	byGroupModel     map[string]*ModelEntry
 	Groups           map[string]struct{}
@@ -136,6 +145,30 @@ func parseRegistry(json gjson.Result) (*Registry, error) {
 	reg.ConfigVersion = strings.TrimSpace(node.Get("configVersion").String())
 	if f := strings.TrimSpace(node.Get("unknownModelFallback").String()); f != "" {
 		reg.UnknownModelFallback = f
+	}
+	if paths := node.Get("groupPaths"); paths.Exists() && paths.IsObject() {
+		reg.GroupPathPrefixes = map[string][]string{}
+		paths.ForEach(func(group, prefixes gjson.Result) bool {
+			key := strings.TrimSpace(group.String())
+			if key == "" || !prefixes.IsArray() {
+				return true
+			}
+			for _, p := range prefixes.Array() {
+				prefix := strings.TrimSpace(p.String())
+				if prefix != "" {
+					reg.GroupPathPrefixes[key] = append(reg.GroupPathPrefixes[key], prefix)
+				}
+			}
+			return true
+		})
+	}
+	if roots := node.Get("rootPathPrefixes"); roots.Exists() && roots.IsArray() {
+		for _, p := range roots.Array() {
+			prefix := strings.TrimSpace(p.String())
+			if prefix != "" {
+				reg.RootPathPrefixes = append(reg.RootPathPrefixes, prefix)
+			}
+		}
 	}
 	if g := strings.TrimSpace(node.Get("defaultGroupKey").String()); g != "" {
 		reg.DefaultGroupKey = g
@@ -341,7 +374,7 @@ func (reg *Registry) Resolve(path, requestedModel string) ResolveResult {
 	if !reg.Enabled {
 		return result
 	}
-	pathGroup, errCode, errMsg := parsePathGroup(path, reg.Groups)
+	pathGroup, rootPath, errCode, errMsg := parsePathGroup(path, reg)
 	result.PathGroup = pathGroup
 	if errCode != "" {
 		result.ErrorCode = errCode
@@ -403,11 +436,16 @@ func (reg *Registry) Resolve(path, requestedModel string) ResolveResult {
 	// have been sending names of their own for as long as it has existed; the
 	// entry says so explicitly rather than the registry guessing it.
 	//
-	// pathGroup must be empty: a group entry is addressed by its own prefix,
-	// and serving another model there is the substitution this refuses
-	// everywhere else. The fallback is resolved as a model, so the caller must
+	// The fallback fires only on a path the ROOT entry actually serves: a group
+	// entry is addressed by its own prefix, and serving another model there is
+	// the substitution this refuses everywhere else. A path the registry can
+	// place on no entry is not a root path either -- an entry whose prefix is
+	// deeper than a first segment used to fall into the root group by default,
+	// which is how a request on one group's route was answered by another
+	// group's fallback model. The fallback is resolved as a model, so the
+	// caller must
 	// still be authorized for it and is charged for it.
-	if pathGroup == "" && reg.UnknownModelFallback != "" {
+	if pathGroup == "" && rootPath && reg.UnknownModelFallback != "" {
 		if entry := reg.byCanonical[reg.UnknownModelFallback]; entry != nil {
 			result.FellBack = true
 			return reg.finish(result, entry)
@@ -460,30 +498,74 @@ func groupModelKey(group, name string) string {
 	return group + groupModelSep + name
 }
 
-func parsePathGroup(rawPath string, groups map[string]struct{}) (string, string, string) {
+// parsePathGroup decides which group's names resolve against the path a
+// request arrived on, and whether that path belongs to the root aggregated
+// entry at all.
+//
+// The prefixes this release's entries serve are published facts, matched
+// longest first. The segment conventions -- "/v1/..." is the root entry,
+// "/<group>/v1/..." is that group -- remain as the fallback for a registry
+// that publishes none, because they are the shape most deployments have. A
+// path that matches neither a published prefix nor a convention returns as an
+// unrecognised root path: rootPath true, group empty, and the root fallback
+// deliberately withheld, because answering another group's fallback model on a
+// path no entry claims is exactly the silent substitution this refuses.
+func parsePathGroup(rawPath string, reg *Registry) (group string, rootPath bool, errCode string, errMsg string) {
 	path := rawPath
 	if cut := strings.IndexAny(path, "?#"); cut >= 0 {
 		path = path[:cut]
 	}
 	path = strings.TrimSpace(path)
 	if path == "" {
-		return "", "", ""
+		return "", false, "", ""
+	}
+	normalised := "/" + strings.Trim(path, "/")
+	// Published prefixes, longest first so the most specific entry wins.
+	type prefixMatch struct {
+		group  string
+		prefix string
+	}
+	var candidates []prefixMatch
+	for groupKey, prefixes := range reg.GroupPathPrefixes {
+		for _, prefix := range prefixes {
+			candidates = append(candidates, prefixMatch{group: groupKey, prefix: prefix})
+		}
+	}
+	for _, prefix := range reg.RootPathPrefixes {
+		candidates = append(candidates, prefixMatch{group: "", prefix: prefix})
+	}
+	sort.Slice(candidates, func(i, j int) bool { return len(candidates[i].prefix) > len(candidates[j].prefix) })
+	for _, candidate := range candidates {
+		if normalised == candidate.prefix || strings.HasPrefix(normalised, candidate.prefix+"/") {
+			if candidate.group == "" {
+				return "", true, "", ""
+			}
+			if _, known := reg.Groups[candidate.group]; !known {
+				return "", false, errUnknownGroup, fmt.Sprintf("unknown group %q", candidate.group)
+			}
+			return candidate.group, false, "", ""
+		}
 	}
 	parts := strings.Split(strings.Trim(path, "/"), "/")
 	if len(parts) == 0 || parts[0] == "" {
-		return "", "", ""
+		// The bare root path: the compatibility path a no-host route answered
+		// on. It is the root entry's own ground.
+		return "", true, "", ""
 	}
 	if strings.EqualFold(parts[0], "v1") {
-		return "", "", ""
+		return "", true, "", ""
 	}
 	if len(parts) >= 2 && strings.EqualFold(parts[1], "v1") {
 		group := parts[0]
-		if _, known := groups[group]; !known {
-			return "", errUnknownGroup, fmt.Sprintf("unknown group %q", group)
+		if _, known := reg.Groups[group]; !known {
+			return "", false, errUnknownGroup, fmt.Sprintf("unknown group %q", group)
 		}
-		return group, "", ""
+		return group, false, "", ""
 	}
-	return "", "", ""
+	// No published prefix and no convention matches. Refusing the fallback
+	// here is the point; the lookup still resolves against the root group, so
+	// a canonical name keeps working the way it always has.
+	return "", false, "", ""
 }
 
 func endpointFromPath(rawPath string) string {
