@@ -40,9 +40,9 @@ func TestTheChargeIsExportedAsAGatewayCounter(t *testing.T) {
 		// any other way exports with no labels and cannot be grouped or
 		// joined against the token counters at all.
 		value, err := host.GetCounterMetric(
-			"route.ai-route-bailian.internal.upstream.outbound|443||bailian.dns.model.glm-5.2.consumer.consumer1.metric.credits")
+			"route.ai-route-bailian.internal.upstream.outbound|443||bailian.dns.model.glm-5.2.consumer.consumer1.metric.credit_millis")
 		require.NoError(t, err)
-		require.Equal(t, uint64(36), value)
+		require.Equal(t, uint64(36000), value)
 	})
 }
 
@@ -75,7 +75,7 @@ func TestAFreeRequestDefinesNoCounter(t *testing.T) {
 			creditsMetricName("ai-route-h20.internal", "outbound|8000||h20.dns", "qwen3-vl-8b", "consumer1"))
 		require.Error(t, err)
 
-		recorded, present := accessLogField(t, host, "credits")
+		recorded, present := accessLogField(t, host, "credit_millis")
 		require.True(t, present)
 		require.Equal(t, "0", recorded)
 	})
@@ -111,6 +111,6 @@ func TestTheCounterUsesTheModelTheResponseReported(t *testing.T) {
 		value, err := host.GetCounterMetric(
 			creditsMetricName("ai-route-qwen3.5-alias.internal", "outbound|443||qwen.dns", "qwen3.5-max-2026-09-01", "consumer1"))
 		require.NoError(t, err)
-		require.Equal(t, uint64(1), value)
+		require.Equal(t, uint64(1000), value)
 	})
 }

@@ -16,7 +16,11 @@ import (
 // without reading a million log lines. Deriving the dashboard from the log
 // would mean scanning the log store for every panel, and deriving a single
 // request's cost from the counter is not possible at all.
-const creditsMetric = "credits"
+// The name carries the unit. The counter holds MILLI-credits, matching the
+// deduction and the log field exactly, and a series called `credits` holding
+// thousandths would be wrong by a factor of a thousand on every dashboard
+// that ever read it.
+const creditsMetric = "credit_millis"
 
 // The metric name is built exactly the way ai-statistics builds its token
 // counters, because Envoy extracts the four labels positionally from this

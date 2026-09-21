@@ -52,8 +52,8 @@ func TestCharactersAreNotChargedWhenSynthesisFailed(t *testing.T) {
 
 	usage.succeeded = true
 	amount, chargeable, err := chargeFor(price, usage)
-	if err != nil || !chargeable || amount != 4 {
-		t.Fatalf("expected 4 credits for 4000 characters, got %d chargeable=%v err=%v", amount, chargeable, err)
+	if err != nil || !chargeable || amount != 4_000 {
+		t.Fatalf("expected 4 credits (4000 millis) for 4000 characters, got %d chargeable=%v err=%v", amount, chargeable, err)
 	}
 }
 
@@ -68,8 +68,8 @@ func TestSecondsComeFromADurationUsage(t *testing.T) {
 
 	price := Price{Unit: UnitSeconds, Per: 60, SecondMicros: 6_000_000}
 	amount, chargeable, err := chargeFor(price, metered{seconds: 60, secondsKnown: true, succeeded: true})
-	if err != nil || !chargeable || amount != 6 {
-		t.Fatalf("expected 6 credits a minute, got %d chargeable=%v err=%v", amount, chargeable, err)
+	if err != nil || !chargeable || amount != 6_000 {
+		t.Fatalf("expected 6 credits (6000 millis) a minute, got %d chargeable=%v err=%v", amount, chargeable, err)
 	}
 }
 
@@ -112,7 +112,9 @@ func TestTokenRoutesAreUnaffectedByTheNewUnits(t *testing.T) {
 		characters: 9999, charactersKnown: true,
 	}
 	amount, chargeable, err := chargeFor(price, usage)
-	if err != nil || !chargeable || amount != 0 {
-		t.Fatalf("expected 15 tokens at 1 credit/1000 to round to 0, got %d chargeable=%v err=%v", amount, chargeable, err)
+	// 15 tokens at 1 credit per 1000 is 0.015 credits. A whole-credit ledger
+	// rounded that to nothing; the milli-credit ledger bills it as 15.
+	if err != nil || !chargeable || amount != 15 {
+		t.Fatalf("expected 15 tokens at 1 credit/1000 to cost 15 millis, got %d chargeable=%v err=%v", amount, chargeable, err)
 	}
 }

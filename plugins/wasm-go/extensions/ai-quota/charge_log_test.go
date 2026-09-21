@@ -40,7 +40,7 @@ func TestTheChargeIsRecordedInTheAccessLog(t *testing.T) {
 					},
 				},
 				terminal: []byte(`data: {"choices":[],"usage":{"prompt_tokens":10000,"completion_tokens":2000,"total_tokens":12000}}`),
-				want:     "36",
+				want:     "36000",
 			},
 			{
 				// Free is a price somebody set. A statistics row showing 0 says
@@ -86,7 +86,7 @@ func TestTheChargeIsRecordedInTheAccessLog(t *testing.T) {
 				host.CallOnHttpRequestBody([]byte(`{"stream":true}`))
 				host.CallOnHttpStreamingResponseBody(tc.terminal, false)
 
-				recorded, present := accessLogField(t, host, "credits")
+				recorded, present := accessLogField(t, host, "credit_millis")
 				if tc.absent {
 					require.False(t, present, "expected no credit field, got %q", recorded)
 					return
@@ -128,7 +128,7 @@ func TestTheChargeDoesNotReplaceWhatOtherPluginsLogged(t *testing.T) {
 		fields := accessLog(t, host)
 		require.Equal(t, float64(10000), fields["input_token"], "the other plugin's token count must survive")
 		require.Equal(t, "glm-5.2", fields["model"], "the other plugin's model must survive")
-		require.Equal(t, float64(12), fields["credits"])
+		require.Equal(t, float64(12000), fields["credit_millis"])
 	})
 }
 

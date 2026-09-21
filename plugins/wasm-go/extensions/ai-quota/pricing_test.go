@@ -104,18 +104,18 @@ func TestChargeFor(t *testing.T) {
 			price:      Price{Unit: UnitTokens, Per: 1000, InputMicros: 2_000_000, OutputMicros: 8_000_000},
 			usage:      tokenBreakdown{Input: 10000, Output: 2000},
 			usageKnown: true,
-			want:       36,
+			want:       36_000,
 			chargeable: true,
 		},
 		{
-			// 66.75 credits. Rounding down on every request would quietly give
-			// away most of a credit each time.
-			name: "cache components round half up",
+			// 66.75 credits. A whole-credit ledger had to round this; the
+			// milli-credit ledger represents it exactly.
+			name: "cache components keep their fractional credit",
 			price: Price{Unit: UnitTokens, Per: 1, InputMicros: 1_000_000, OutputMicros: 2_000_000,
 				CacheReadMicros: 100_000, CacheWriteMicros: 1_250_000},
 			usage:      tokenBreakdown{Input: 20, Output: 10, CacheRead: 80, CacheWrite: 15},
 			usageKnown: true,
-			want:       67,
+			want:       66_750,
 			chargeable: true,
 		},
 		{
@@ -125,7 +125,7 @@ func TestChargeFor(t *testing.T) {
 			price:      Price{Unit: UnitRequests, Per: 1, RequestMicros: 5_000_000},
 			usage:      tokenBreakdown{},
 			usageKnown: false,
-			want:       5,
+			want:       5_000,
 			chargeable: true,
 		},
 		{
@@ -140,20 +140,48 @@ func TestChargeFor(t *testing.T) {
 		},
 		{
 			name:       "a zero rate really is free",
-			price:      Price{Unit: UnitTokens, Per: 1, MinCharge: 1},
+			price:      Price{Unit: UnitTokens, Per: 1, MinChargeMillis: 1},
 			usage:      tokenBreakdown{Input: 10000, Output: 5000},
 			usageKnown: true,
 			want:       0,
 			chargeable: true,
 		},
 		{
-			// Too small to round to a credit, but not free: min_charge is how
-			// an operator says a real request must never cost nothing.
-			name:       "min charge floors a sub-credit request",
-			price:      Price{Unit: UnitTokens, Per: 1, InputMicros: 1_000, MinCharge: 1},
+			// Too small to round to even a thousandth of a credit, but not
+			// free: min_charge_millis is how an operator says a real request
+			// must never cost nothing.
+			name:       "min charge floors a sub-milli request",
+			price:      Price{Unit: UnitTokens, Per: 1, InputMicros: 10, MinChargeMillis: 1},
 			usage:      tokenBreakdown{Input: 10},
 			usageKnown: true,
 			want:       1,
+			chargeable: true,
+		},
+		{
+			// The regression this ledger exists for. Priced from a vendor
+			// sheet -- 8 credits per million input, 28 per million output --
+			// an ordinary 500-in/500-out chat costs 0.018 credits. Rounded to
+			// whole credits that is zero, and for a while every ordinary call
+			// on this gateway billed nothing at all.
+			name: "an ordinary chat priced per million tokens still bills",
+			price: Price{Unit: UnitTokens, Per: 1_000_000,
+				InputMicros: 8_000_000, OutputMicros: 28_000_000},
+			usage:      tokenBreakdown{Input: 500, Output: 500},
+			usageKnown: true,
+			want:       18,
+			chargeable: true,
+		},
+		{
+			// `per` scales the rate and the divisor together, so the same
+			// price quoted at either scale must charge the same. An operator
+			// who reads "每多少 Token" as a lever on cost is reading it wrong,
+			// and this is what holds that.
+			name: "per is presentation and does not change the charge",
+			price: Price{Unit: UnitTokens, Per: 1_000,
+				InputMicros: 8_000, OutputMicros: 28_000},
+			usage:      tokenBreakdown{Input: 500, Output: 500},
+			usageKnown: true,
+			want:       18,
 			chargeable: true,
 		},
 	}
@@ -189,11 +217,14 @@ func TestStreamingChargeUsesTheModelPrice(t *testing.T) {
 				// No price anywhere: one token, one unit, exactly as before
 				// credits existed. This is what makes the build safe to deploy
 				// ahead of any price configuration.
-				name:     "unpriced route still charges tokens",
+				// One token still costs one whole credit here, which in the
+				// ledger's unit is 1000. An unpriced route must not get a
+				// thousandfold discount out of a units change.
+				name:     "unpriced route still charges one credit per token",
 				extra:    map[string]interface{}{},
 				model:    "glm-5.2",
 				terminal: []byte(`data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`),
-				want:     "12",
+				want:     "12000",
 			},
 			{
 				name: "model price wins over the route default",
@@ -205,7 +236,7 @@ func TestStreamingChargeUsesTheModelPrice(t *testing.T) {
 				},
 				model:    "glm-5.2",
 				terminal: []byte(`data: {"choices":[],"usage":{"prompt_tokens":10000,"completion_tokens":2000,"total_tokens":12000}}`),
-				want:     "36",
+				want:     "36000",
 			},
 			{
 				// A model nobody has priced is the normal case on a route whose
@@ -217,7 +248,7 @@ func TestStreamingChargeUsesTheModelPrice(t *testing.T) {
 				},
 				model:    "a-model-that-appeared-yesterday",
 				terminal: []byte(`data: {"choices":[],"usage":{"prompt_tokens":10000,"completion_tokens":2000,"total_tokens":12000}}`),
-				want:     "12",
+				want:     "12000",
 			},
 			{
 				// Self-hosted capacity: the intent is written down as a rate of
@@ -271,7 +302,7 @@ func TestAFailedRequestIsNotChargedPerRequest(t *testing.T) {
 	got, chargeable, err = chargeFor(price, metered{succeeded: true})
 	require.NoError(t, err)
 	require.True(t, chargeable)
-	require.Equal(t, int64(2), got)
+	require.Equal(t, int64(2_000), got)
 }
 
 // TestAFailedStreamStillPaysForTheTokensItProduced: the status gate is for
@@ -285,5 +316,5 @@ func TestAFailedStreamStillPaysForTheTokensItProduced(t *testing.T) {
 	got, chargeable, err := chargeFor(price, metered{tokens: usage, tokensKnown: true, succeeded: false})
 	require.NoError(t, err)
 	require.True(t, chargeable)
-	require.Equal(t, int64(18), got)
+	require.Equal(t, int64(18_000), got)
 }

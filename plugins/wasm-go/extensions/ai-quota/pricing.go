@@ -22,10 +22,29 @@ import (
 // "0.02 credits per 1000 tokens" expressible as `per: 1000, input_micros:
 // 20000`.
 //
+// THE LEDGER IS IN MILLI-CREDITS. The quota counter holds thousandths of a
+// credit, and every charge this file produces is in that unit. The reason is
+// arithmetic, not taste: prices are quoted per MILLION tokens, so a whole
+// credit is far too coarse to be the smallest billable amount. At 8 credits
+// per million input tokens, a 2000-token request costs 0.016 credits -- which
+// rounding to whole credits turns into zero, and a request that costs nothing
+// is a request that does not count against a quota. Every ordinary call fell
+// through that gap. Thousandths make the same price bill 16, exactly.
+//
+// A floor of one milli-credit keeps the rounding error under 0.0005 credits
+// per request, and round-half-up is unbiased, so the error does not
+// accumulate in either direction over many requests.
+//
 // All money arithmetic is int64. On wasm32 a Go `int` is 32 bits, so the
 // charge is bounds-checked before it reaches the Redis client's `int`
 // parameter.
-const microsPerCredit = 1_000_000
+const (
+	microsPerCredit = 1_000_000
+	millisPerCredit = 1_000
+	// microsPerMilli is the divisor that turns a micro-credit amount into the
+	// ledger's unit.
+	microsPerMilli = microsPerCredit / millisPerCredit
+)
 
 // Metering units.
 //
@@ -80,11 +99,16 @@ type Price struct {
 	RequestMicros    int64
 	SecondMicros     int64
 	CharacterMicros  int64
-	// MinCharge is the floor, in whole credits, for a request whose computed
-	// cost rounded down to nothing. Zero -- the default -- means a rate of
-	// zero really does charge zero, which is what a free self-hosted model
-	// wants. Set it to 1 where "too small to bill" must not become "free".
-	MinCharge int64
+	// MinChargeMillis is the floor, in MILLI-credits, for a request whose
+	// computed cost rounded down to nothing. Zero -- the default -- means a
+	// rate of zero really does charge zero, which is what a free self-hosted
+	// model wants.
+	//
+	// With a milli-credit ledger this is a far smaller lever than it was: a
+	// cost only rounds to nothing below 0.0005 credits, so this no longer
+	// stands between "priced" and "free" for any realistic rate. It is kept
+	// for rates deliberately set near zero.
+	MinChargeMillis int64
 }
 
 // tokenBreakdown is one request's metered token usage. The four fields are
@@ -175,7 +199,7 @@ func parsePrice(value gjson.Result, where string) (Price, error) {
 		{"request_micros", &price.RequestMicros},
 		{"second_micros", &price.SecondMicros},
 		{"character_micros", &price.CharacterMicros},
-		{"min_charge", &price.MinCharge},
+		{"min_charge_millis", &price.MinChargeMillis},
 	}
 	for _, field := range fields {
 		raw := value.Get(field.key)
@@ -228,7 +252,7 @@ type metered struct {
 	succeeded       bool
 }
 
-// chargeFor converts one request's metered usage into whole credits.
+// chargeFor converts one request's metered usage into MILLI-credits.
 //
 // The second return value is "chargeable". False means this request must not
 // move the quota at all -- not that it is free. A `tokens` price cannot bill
@@ -288,17 +312,21 @@ func chargeFor(price Price, usage metered) (int64, bool, error) {
 	if per <= 0 {
 		per = 1
 	}
-	// Round half up on the divided amount so a price quoted per 1000 tokens
-	// does not lose its last digit on every request.
-	credits := (micros + per*microsPerCredit/2) / (per * microsPerCredit)
+	// Round half up, into MILLI-credits. Note what `per` does and does not do
+	// here: it scales the rate and the divisor together, so quoting the same
+	// price per 1000 tokens or per 1,000,000 produces the identical charge.
+	// `per` is presentation. The only number that decides what a request costs
+	// is the rate per metered unit.
+	denominator := per * microsPerMilli
+	millis := (micros + denominator/2) / denominator
 
-	if credits == 0 && micros > 0 && price.MinCharge > 0 {
-		credits = price.MinCharge
+	if millis == 0 && micros > 0 && price.MinChargeMillis > 0 {
+		millis = price.MinChargeMillis
 	}
-	if credits < 0 || credits > maxCharge {
-		return 0, false, fmt.Errorf("charge %d is out of range", credits)
+	if millis < 0 || millis > maxCharge {
+		return 0, false, fmt.Errorf("charge %d is out of range", millis)
 	}
-	return credits, true, nil
+	return millis, true, nil
 }
 
 // countRequestCharacters measures the text a `characters` price bills for.

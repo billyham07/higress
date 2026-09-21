@@ -37,7 +37,14 @@ const (
 	// creditsLogKey is the field name this plugin contributes to the shared
 	// access-log object. It sits alongside the token counts ai-statistics
 	// writes, so one log line carries both what was used and what it cost.
-	creditsLogKey = "credits"
+	//
+	// The name carries the unit because the value is in MILLI-credits, and
+	// ai-statistics turns this field into the gateway counter
+	// route_upstream_model_consumer_metric_credit_millis automatically. A
+	// field still called `credits` holding thousandths would make every
+	// reader -- dashboard, log column, whoever greps it next -- silently
+	// wrong by a factor of a thousand.
+	creditsLogKey = "credit_millis"
 	// quotaCharactersContextKey holds the character count read from the
 	// request body, for routes priced per character. It is recorded on the
 	// way in because the response -- audio -- cannot carry it.
@@ -93,7 +100,8 @@ type QuotaConfig struct {
 	redisClient        wrapper.RedisClient
 	// DefaultPrice applies to every model this route serves that has no entry
 	// of its own. Nil, together with an empty ModelPrices, means the route is
-	// unpriced and one token costs one unit -- the behaviour before credits.
+	// unpriced and one token costs one whole credit -- the behaviour before
+	// credits, expressed in the milli-credit ledger.
 	DefaultPrice *Price           `yaml:"default_price"`
 	ModelPrices  map[string]Price `yaml:"model_prices"`
 	// counters caches the credit counters this rule has defined, keyed by the
@@ -440,6 +448,10 @@ func chargeQuotaOnce(ctx wrapper.HttpContext, config QuotaConfig) {
 // read-merge-write either way, so naming the right key adds a field rather
 // than replacing what ai-statistics put there.
 //
+// The amount is in milli-credits, matching the deduction exactly: the log
+// line, the gateway counter and the Redis counter must agree, and they only
+// agree if nobody rescales one of them on the way out.
+//
 // A charge of zero is reported. Free is a price an operator set, and a
 // statistics row showing 0 says something a missing field does not: an
 // absent field means the request was never charged at all -- no usage
@@ -461,12 +473,14 @@ func reportCharge(ctx wrapper.HttpContext, amount int64) {
 	}
 }
 
-// chargeAmount is what this request costs, in whole credits.
+// chargeAmount is what this request costs, in MILLI-credits.
 //
-// An unpriced route keeps the pre-credits behaviour exactly: the charge is
-// the token count. That is what makes this build safe to roll out ahead of
+// An unpriced route keeps the pre-credits behaviour exactly: one token costs
+// one whole credit. That is what makes this build safe to roll out ahead of
 // any price configuration -- a route whose config has not been touched
-// behaves as it did yesterday.
+// behaves as it did yesterday. The token count is scaled into the ledger's
+// unit to hold that equivalence; dropping the scale here would quietly make
+// every unpriced route a thousand times cheaper.
 func chargeAmount(ctx wrapper.HttpContext, config QuotaConfig, model string) (int64, bool) {
 	usage := meteredUsage(ctx)
 
@@ -475,7 +489,7 @@ func chargeAmount(ctx wrapper.HttpContext, config QuotaConfig, model string) (in
 		if !usage.tokensKnown {
 			return 0, false
 		}
-		return usage.tokens.total(), true
+		return usage.tokens.total() * millisPerCredit, true
 	}
 
 	amount, chargeable, err := chargeFor(*price, usage)
