@@ -26,6 +26,10 @@ const (
 	quotaChargedContextKey = "ai-quota-charged"
 	quotaTerminalTailKey   = "ai-quota-terminal-tail"
 	quotaModelContextKey   = "ai-quota-model"
+	// creditsLogKey is the field name this plugin contributes to the shared
+	// access-log object. It sits alongside the token counts ai-statistics
+	// writes, so one log line carries both what was used and what it cost.
+	creditsLogKey = "credits"
 	// modelHeader is written by the model-router plugin, which runs in the
 	// AUTHN phase and therefore before this one. Reading the model from a
 	// header rather than from the request body keeps the completion path on
@@ -308,6 +312,40 @@ func chargeQuotaOnce(ctx wrapper.HttpContext, config QuotaConfig) {
 		return
 	}
 	ctx.SetContext(quotaChargedContextKey, true)
+	reportCharge(ctx, amount)
+}
+
+// reportCharge puts what was actually charged into the access log.
+//
+// The charge is the only number that says what a request cost, and nothing
+// downstream can recompute it: prices change, so multiplying yesterday's
+// tokens by today's rate answers a different question. It has to be recorded
+// when it happens.
+//
+// The log attribute is written through the shared `custom_log` property,
+// which is read-merge-write. ai-statistics writes the token counts into the
+// same object from its own filter, so this adds a field rather than
+// replacing what is there, and needs no access-log format change.
+//
+// A charge of zero is reported. Free is a price an operator set, and a
+// statistics row showing 0 says something a missing field does not: an
+// absent field means the request was never charged at all -- no usage
+// arrived under a token price -- and those two must not look alike.
+func reportCharge(ctx wrapper.HttpContext, amount int64) {
+	// Contribute exactly one field, by replacing this plugin's attribute map
+	// rather than adding to it. The wrapper merges the WHOLE map into the
+	// shared object, and tokenusage has already filled it with its own view
+	// of the request -- including model "unknown" when the terminal chunk
+	// carried no model name. Merging all of that would overwrite what
+	// ai-statistics logged from a filter that did see the request body, so a
+	// plugin that only wants to add a cost would silently corrupt the model
+	// and token fields of every log line.
+	ctx.SetUserAttributeMap(map[string]interface{}{creditsLogKey: amount})
+	if err := ctx.WriteUserAttributeToLog(); err != nil {
+		// The quota has already moved. Losing the log line is bad, but it is
+		// not a reason to fail a request whose money is already spent.
+		log.Warnf("failed to record the credit charge in the access log: %v", err)
+	}
 }
 
 // chargeAmount is what this request costs, in whole credits.
