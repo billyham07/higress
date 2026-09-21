@@ -11,9 +11,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// customLogKey is the shared access-log property. It is the wasm-go wrapper's
-// own constant, restated here because the test reads the property directly.
-const customLogKey = "custom_log"
+// aiLogKey is the property the charge has to land in. It is restated here
+// rather than imported because the test reads the property directly, and
+// because naming it is the point of the assertion.
+//
+// This test used to read "custom_log", which is where the wrapper's
+// WriteUserAttributeToLog() puts things. Nothing reads that property: the
+// gateway's access-log format carries one %FILTER_STATE(wasm.ai_log:PLAIN)%
+// and no custom_log. So the test passed on every build while the field never
+// once appeared in a real access log. It was measuring that a write
+// happened, not that the charge was recorded.
+const aiLogKey = "ai_log"
 
 func TestTheChargeIsRecordedInTheAccessLog(t *testing.T) {
 	test.RunTest(t, func(t *testing.T) {
@@ -65,7 +73,7 @@ func TestTheChargeIsRecordedInTheAccessLog(t *testing.T) {
 				// The emulator's property store outlives one host, so a
 				// subtest asserting that nothing was written would otherwise
 				// read the previous subtest's charge.
-				require.NoError(t, host.SetProperty([]string{customLogKey}, quoteForProperty([]byte("{}"))))
+				require.NoError(t, host.SetProperty([]string{aiLogKey}, quoteForProperty([]byte("{}"))))
 
 				host.CallOnHttpRequestHeaders([][2]string{
 					{":authority", "example.com"},
@@ -103,7 +111,7 @@ func TestTheChargeDoesNotReplaceWhatOtherPluginsLogged(t *testing.T) {
 		// replaced it would silently delete the other plugin's fields.
 		existing, err := json.Marshal(map[string]any{"input_token": 10000, "model": "glm-5.2"})
 		require.NoError(t, err)
-		require.NoError(t, host.SetProperty([]string{customLogKey}, quoteForProperty(existing)))
+		require.NoError(t, host.SetProperty([]string{aiLogKey}, quoteForProperty(existing)))
 
 		host.CallOnHttpRequestHeaders([][2]string{
 			{":authority", "example.com"},
@@ -128,7 +136,7 @@ func TestTheChargeDoesNotReplaceWhatOtherPluginsLogged(t *testing.T) {
 // wrapper stores it as a quoted JSON string, so it is unquoted first.
 func accessLog(t *testing.T, host test.TestHost) map[string]any {
 	t.Helper()
-	raw, err := host.GetProperty([]string{customLogKey})
+	raw, err := host.GetProperty([]string{aiLogKey})
 	require.NoError(t, err)
 	if len(raw) == 0 {
 		return map[string]any{}

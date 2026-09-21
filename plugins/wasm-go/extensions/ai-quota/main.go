@@ -431,10 +431,14 @@ func chargeQuotaOnce(ctx wrapper.HttpContext, config QuotaConfig) {
 // tokens by today's rate answers a different question. It has to be recorded
 // when it happens.
 //
-// The log attribute is written through the shared `custom_log` property,
-// which is read-merge-write. ai-statistics writes the token counts into the
-// same object from its own filter, so this adds a field rather than
-// replacing what is there, and needs no access-log format change.
+// It is written under wrapper.AILogKey, which is the `ai_log` property. That
+// is the object ai-statistics fills and the only one the access-log format
+// emits -- it carries a single %FILTER_STATE(wasm.ai_log:PLAIN)% and no
+// custom_log at all. WriteUserAttributeToLog(), the obvious-looking call,
+// writes to custom_log instead, so a charge recorded through it lands in a
+// property nothing reads and the field simply never appears. The write is
+// read-merge-write either way, so naming the right key adds a field rather
+// than replacing what ai-statistics put there.
 //
 // A charge of zero is reported. Free is a price an operator set, and a
 // statistics row showing 0 says something a missing field does not: an
@@ -450,7 +454,7 @@ func reportCharge(ctx wrapper.HttpContext, amount int64) {
 	// plugin that only wants to add a cost would silently corrupt the model
 	// and token fields of every log line.
 	ctx.SetUserAttributeMap(map[string]interface{}{creditsLogKey: amount})
-	if err := ctx.WriteUserAttributeToLog(); err != nil {
+	if err := ctx.WriteUserAttributeToLogWithKey(wrapper.AILogKey); err != nil {
 		// The quota has already moved. Losing the log line is bad, but it is
 		// not a reason to fail a request whose money is already spent.
 		log.Warnf("failed to record the credit charge in the access log: %v", err)

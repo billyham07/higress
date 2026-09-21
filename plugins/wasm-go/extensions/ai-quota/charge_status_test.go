@@ -25,7 +25,7 @@ func TestAPerRequestPriceChargesASuccessfulCall(t *testing.T) {
 		host, status := test.NewTestHost(perRequestConfig())
 		defer host.Reset()
 		require.Equal(t, types.OnPluginStartStatusOK, status)
-		require.NoError(t, host.SetProperty([]string{customLogKey}, quoteForProperty([]byte("{}"))))
+		require.NoError(t, host.SetProperty([]string{aiLogKey}, quoteForProperty([]byte("{}"))))
 
 		host.CallOnHttpRequestHeaders([][2]string{
 			{":authority", "example.com"},
@@ -52,7 +52,7 @@ func TestAPerRequestPriceDoesNotChargeAFailedCall(t *testing.T) {
 				host, startStatus := test.NewTestHost(perRequestConfig())
 				defer host.Reset()
 				require.Equal(t, types.OnPluginStartStatusOK, startStatus)
-				require.NoError(t, host.SetProperty([]string{customLogKey}, quoteForProperty([]byte("{}"))))
+				require.NoError(t, host.SetProperty([]string{aiLogKey}, quoteForProperty([]byte("{}"))))
 
 				host.CallOnHttpRequestHeaders([][2]string{
 					{":authority", "example.com"},
@@ -84,7 +84,7 @@ func TestATokenPriceIsUnaffectedByTheStatusGate(t *testing.T) {
 		}))
 		defer host.Reset()
 		require.Equal(t, types.OnPluginStartStatusOK, status)
-		require.NoError(t, host.SetProperty([]string{customLogKey}, quoteForProperty([]byte("{}"))))
+		require.NoError(t, host.SetProperty([]string{aiLogKey}, quoteForProperty([]byte("{}"))))
 
 		host.CallOnHttpRequestHeaders([][2]string{
 			{":authority", "example.com"},
