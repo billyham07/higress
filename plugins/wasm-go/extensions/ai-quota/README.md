@@ -41,7 +41,9 @@ description: AI 配额管理插件配置参考
 
 Redis 里的计数器一直只有一个数字，请求把它减掉。积分改变的只是这个数字怎么算出来：不再是「一个 token 一个单位」，而是本次用量乘以该模型配置的价格。
 
-**不配 `default_price` 也不配 `model_prices` 时，行为和以前完全一致**（一个 token 扣一个单位）。因此这个版本可以先发布、后配价，没改过配置的路由不会有任何变化。
+**账本单位是毫积分（千分之一积分）。** 计数器里存的、日志字段 `credit_millis` 里写的、网关计数器 `route_upstream_model_consumer_metric_credit_millis` 里加的，都是毫积分。原因是算术上的：价格按百万 token 报，而整数积分装不下这么细的金额 —— 按 8 积分/百万输入算，一次 2000 token 的请求值 0.016 积分，四舍五入到整数积分就是 0，配额一分不扣。用千分位记账，同样这笔扣 16 毫积分，误差上限 0.0005 积分且无偏。
+
+**不配 `default_price` 也不配 `model_prices` 时，行为和以前完全一致**（一个 token 扣一个整积分，即 1000 毫积分）。因此这个版本可以先发布、后配价，没改过配置的路由不会有任何变化。
 
 模型名取自请求头 `x-higress-llm-model`，由 `model-router` 插件在 AUTHN 阶段写入，早于本插件。因此 completion 路径仍然不读请求体。
 
@@ -55,13 +57,13 @@ Redis 里的计数器一直只有一个数字，请求把它减掉。积分改�
 | 配置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `unit` | string | `tokens` | 计量单位：`tokens` 或 `requests` |
-| `per` | int | 1 | 一份费率覆盖多少个计量单位。按千 token 报价填 `1000` |
+| `per` | int | 1 | 一份费率覆盖多少个计量单位。按千 token 报价填 `1000`，按百万填 `1000000`。**它只是刻度**：`per` 同时缩放费率和除数，同一个价换任何刻度写都扣一样的钱 |
 | `input_micros` | int | 0 | 输入 token 费率，单位微积分（1e6 微积分 = 1 积分） |
 | `output_micros` | int | 0 | 输出 token 费率 |
 | `cache_read_micros` | int | 0 | 缓存命中 token 费率 |
 | `cache_write_micros` | int | 0 | 缓存写入 token 费率 |
 | `request_micros` | int | 0 | `unit: requests` 时，一次请求的费率 |
-| `min_charge` | int | 0 | 算下来不足 1 积分时的下限。默认 0，即费率为 0 就真的免费 |
+| `min_charge_millis` | int | 0 | 算下来不足 1 毫积分时的下限。默认 0，即费率为 0 就真的免费 |
 
 费率是**整数**的微积分数，配置和运算里都不出现浮点；小数费率会被拒绝而不是被截断成 0。四个 token 分量按互不重叠处理后相加，这与插件原有的口径一致（Anthropic 把 cache read / cache creation 报在 `input_tokens` 之外）。
 
