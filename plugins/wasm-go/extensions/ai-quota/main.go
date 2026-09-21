@@ -38,6 +38,13 @@ const (
 	// access-log object. It sits alongside the token counts ai-statistics
 	// writes, so one log line carries both what was used and what it cost.
 	creditsLogKey = "credits"
+	// quotaCharactersContextKey holds the character count read from the
+	// request body, for routes priced per character. It is recorded on the
+	// way in because the response -- audio -- cannot carry it.
+	quotaCharactersContextKey = "ai-quota-characters"
+	// quotaSecondsContextKey holds a duration-style usage read from the
+	// response, for routes priced per second.
+	quotaSecondsContextKey = "ai-quota-seconds"
 	// modelHeader is written by the model-router plugin, which runs in the
 	// AUTHN phase and therefore before this one. Reading the model from a
 	// header rather than from the request body keeps the completion path on
@@ -94,6 +101,27 @@ type QuotaConfig struct {
 	// wrong, but the cache is also what keeps the per-request path free of
 	// host calls once a (route, model, consumer) triple has been seen.
 	counters map[string]proxywasm.MetricCounter
+}
+
+// metersCharacters says whether any price on this route bills per character.
+//
+// It decides one thing: whether the request body is buffered. The completion
+// path otherwise runs on DontReadRequestBody, and the comment on modelHeader
+// explains why that is worth protecting -- buffering every prompt to learn
+// one field costs far more than the charge it enables. A per-character price
+// is the one case where the request body IS the billable quantity, so the
+// cost is the point rather than an overhead, and it is paid only on the
+// routes configured that way.
+func (config QuotaConfig) metersCharacters() bool {
+	if config.DefaultPrice != nil && config.DefaultPrice.Unit == UnitCharacters {
+		return true
+	}
+	for _, price := range config.ModelPrices {
+		if price.Unit == UnitCharacters {
+			return true
+		}
+	}
+	return false
 }
 
 type Consumer struct {
@@ -228,8 +256,14 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig) types
 		return types.ActionContinue
 	}
 
-	// there is no need to read request body when it is on chat completion mode
-	context.DontReadRequestBody()
+	// The completion path normally needs nothing from the request body -- the
+	// model arrives in a header. A route priced per character is the
+	// exception: its billable quantity is the request text itself.
+	if config.metersCharacters() {
+		context.BufferRequestBody()
+	} else {
+		context.DontReadRequestBody()
+	}
 	// check quota here
 	config.redisClient.Get(config.RedisKeyPrefix+consumer, func(response resp.Value) {
 		isDenied := false
@@ -290,7 +324,19 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config QuotaConfig, body []byte)
 	if !ok {
 		return types.ActionContinue
 	}
-	if chatMode == ChatModeNone || chatMode == ChatModeCompletion {
+	if chatMode == ChatModeCompletion {
+		// Only reached when metersCharacters() asked for the body.
+		if characters, ok := countRequestCharacters(body); ok {
+			ctx.SetContext(quotaCharactersContextKey, characters)
+		} else {
+			// Left unset on purpose: chargeFor treats an unknown count as
+			// "do not touch the quota", which surfaces a field-name
+			// mismatch instead of silently synthesising free requests.
+			log.Warnf("per-character pricing found no %v field in the request body", characterFields)
+		}
+		return types.ActionContinue
+	}
+	if chatMode == ChatModeNone {
 		return types.ActionContinue
 	}
 	adminMode, ok := ctx.GetContext("adminMode").(AdminMode)
@@ -331,6 +377,15 @@ func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config QuotaConfig, da
 		}
 		if usage.Model != "" {
 			ctx.SetContext(quotaUsageModelContextKey, usage.Model)
+		}
+	}
+
+	// A duration-style usage is not a token count, so GetTokenUsage ignores
+	// it entirely. Transcription reports one, and it is the only number that
+	// route can be billed on.
+	if _, already := ctx.GetContext(quotaSecondsContextKey).(int64); !already {
+		if seconds, ok := responseSeconds(data); ok {
+			ctx.SetContext(quotaSecondsContextKey, seconds)
 		}
 	}
 
@@ -409,17 +464,17 @@ func reportCharge(ctx wrapper.HttpContext, amount int64) {
 // any price configuration -- a route whose config has not been touched
 // behaves as it did yesterday.
 func chargeAmount(ctx wrapper.HttpContext, config QuotaConfig, model string) (int64, bool) {
-	usage, usageKnown := usageBreakdown(ctx)
+	usage := meteredUsage(ctx)
 
 	price := priceFor(config, model)
 	if price == nil {
-		if !usageKnown {
+		if !usage.tokensKnown {
 			return 0, false
 		}
-		return usage.total(), true
+		return usage.tokens.total(), true
 	}
 
-	amount, chargeable, err := chargeFor(*price, usage, usageKnown, responseSucceeded(ctx))
+	amount, chargeable, err := chargeFor(*price, usage)
 	if err != nil {
 		// A charge that cannot be computed must not silently become zero: the
 		// request consumed real capacity. Leaving the quota untouched and
@@ -435,7 +490,20 @@ func chargeAmount(ctx wrapper.HttpContext, config QuotaConfig, model string) (in
 // The components are disjoint and summed, matching what getQuotaToken has
 // always done: Anthropic reports cache reads and cache creations alongside
 // input_tokens, not inside them.
-func usageBreakdown(ctx wrapper.HttpContext) (tokenBreakdown, bool) {
+func meteredUsage(ctx wrapper.HttpContext) metered {
+	usage := metered{succeeded: responseSucceeded(ctx)}
+	if characters, ok := ctx.GetContext(quotaCharactersContextKey).(int64); ok {
+		usage.characters, usage.charactersKnown = characters, true
+	}
+	if seconds, ok := ctx.GetContext(quotaSecondsContextKey).(int64); ok {
+		usage.seconds, usage.secondsKnown = seconds, true
+	}
+	usage.tokens, usage.tokensKnown = tokenUsage(ctx)
+	return usage
+}
+
+// tokenUsage recovers the four token components this request reported.
+func tokenUsage(ctx wrapper.HttpContext) (tokenBreakdown, bool) {
 	var usage tokenBreakdown
 	if details, ok := ctx.GetContext(tokenusage.CtxKeyInputTokenDetails).(map[string]int64); ok {
 		usage.CacheRead = details[tokenusage.InputTokenDetailsKeyAnthropicMessagesUsageCacheReadInputTokens]

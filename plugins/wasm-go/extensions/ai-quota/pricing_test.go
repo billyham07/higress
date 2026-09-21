@@ -160,7 +160,7 @@ func TestChargeFor(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, chargeable, err := chargeFor(tc.price, tc.usage, tc.usageKnown, true)
+			got, chargeable, err := chargeFor(tc.price, metered{tokens: tc.usage, tokensKnown: tc.usageKnown, succeeded: true})
 			require.NoError(t, err)
 			require.Equal(t, tc.chargeable, chargeable)
 			require.Equal(t, tc.want, got)
@@ -172,7 +172,7 @@ func TestChargeForRefusesAnOutOfRangeAmount(t *testing.T) {
 	// A Go int is 32 bits on wasm. A charge past that must be refused, not
 	// wrapped around into a small and plausible-looking credit.
 	price := Price{Unit: UnitTokens, Per: 1, InputMicros: 1_000_000_000}
-	_, _, err := chargeFor(price, tokenBreakdown{Input: 1_000_000_000}, true, true)
+	_, _, err := chargeFor(price, metered{tokens: tokenBreakdown{Input: 1_000_000_000}, tokensKnown: true, succeeded: true})
 	require.Error(t, err)
 }
 
@@ -263,12 +263,12 @@ func TestStreamingChargeUsesTheModelPrice(t *testing.T) {
 func TestAFailedRequestIsNotChargedPerRequest(t *testing.T) {
 	price := Price{Unit: UnitRequests, Per: 1, RequestMicros: 2_000_000}
 
-	got, chargeable, err := chargeFor(price, tokenBreakdown{}, false, false)
+	got, chargeable, err := chargeFor(price, metered{succeeded: false})
 	require.NoError(t, err)
 	require.False(t, chargeable, "a failed request must not be charged")
 	require.Equal(t, int64(0), got)
 
-	got, chargeable, err = chargeFor(price, tokenBreakdown{}, false, true)
+	got, chargeable, err = chargeFor(price, metered{succeeded: true})
 	require.NoError(t, err)
 	require.True(t, chargeable)
 	require.Equal(t, int64(2), got)
@@ -282,7 +282,7 @@ func TestAFailedStreamStillPaysForTheTokensItProduced(t *testing.T) {
 	price := Price{Unit: UnitTokens, Per: 1000, InputMicros: 1_000_000, OutputMicros: 4_000_000}
 	usage := tokenBreakdown{Input: 10_000, Output: 2_000}
 
-	got, chargeable, err := chargeFor(price, usage, true, false)
+	got, chargeable, err := chargeFor(price, metered{tokens: usage, tokensKnown: true, succeeded: false})
 	require.NoError(t, err)
 	require.True(t, chargeable)
 	require.Equal(t, int64(18), got)

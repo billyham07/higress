@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/tidwall/gjson"
 )
@@ -26,13 +27,38 @@ import (
 // parameter.
 const microsPerCredit = 1_000_000
 
-// Metering units. `tokens` prices the four token components; `requests`
-// prices one call regardless of what it produced, which is the honest unit
-// for an endpoint whose response carries no usage at all.
+// Metering units.
+//
+// `tokens` prices the four token components. `requests` prices one call
+// regardless of what it produced. The other two exist because this gateway
+// fronts endpoints that genuinely do not deal in tokens, and the upstreams
+// already report the right number:
+//
+//	seconds     -- transcription. Qwen3-ASR answers
+//	               {"usage":{"type":"duration","seconds":1}}, so the billable
+//	               quantity arrives in the response like a token count does.
+//	characters  -- speech synthesis. The response is audio and carries no
+//	               usage at all, so the quantity has to come from the REQUEST
+//	               text. This is the only unit metered before the upstream is
+//	               even called, and the only one that costs a body buffer.
+//
+// Inventing a token count for these -- which is what the old fixed-83333
+// multimodal rule did -- prices them against a number nobody can check.
 const (
-	UnitTokens   = "tokens"
-	UnitRequests = "requests"
+	UnitTokens     = "tokens"
+	UnitRequests   = "requests"
+	UnitSeconds    = "seconds"
+	UnitCharacters = "characters"
 )
+
+// characterFields are the request fields a `characters` price may count,
+// tried in order. `input` is what OpenAI's /v1/audio/speech uses and what
+// Qwen3-TTS accepts; `text` covers providers that kept their own name.
+//
+// If none of them is present the request is reported as UNMETERED rather
+// than as zero characters. A missing field is a configuration or provider
+// mismatch, and billing it as free would hide that indefinitely.
+var characterFields = []string{"input", "text"}
 
 // maxCharge is the largest charge that can be handed to the Redis client's
 // int parameter on a 32-bit target. A request costing more than this is a
@@ -52,6 +78,8 @@ type Price struct {
 	CacheReadMicros  int64
 	CacheWriteMicros int64
 	RequestMicros    int64
+	SecondMicros     int64
+	CharacterMicros  int64
 	// MinCharge is the floor, in whole credits, for a request whose computed
 	// cost rounded down to nothing. Zero -- the default -- means a rate of
 	// zero really does charge zero, which is what a free self-hosted model
@@ -122,9 +150,10 @@ func parsePrice(value gjson.Result, where string) (Price, error) {
 		price.Unit = UnitTokens
 	}
 	switch price.Unit {
-	case UnitTokens, UnitRequests:
+	case UnitTokens, UnitRequests, UnitSeconds, UnitCharacters:
 	default:
-		return Price{}, fmt.Errorf("%s.unit must be %s or %s", where, UnitTokens, UnitRequests)
+		return Price{}, fmt.Errorf("%s.unit must be one of %s, %s, %s, %s",
+			where, UnitTokens, UnitRequests, UnitSeconds, UnitCharacters)
 	}
 
 	price.Per = value.Get("per").Int()
@@ -144,6 +173,8 @@ func parsePrice(value gjson.Result, where string) (Price, error) {
 		{"cache_read_micros", &price.CacheReadMicros},
 		{"cache_write_micros", &price.CacheWriteMicros},
 		{"request_micros", &price.RequestMicros},
+		{"second_micros", &price.SecondMicros},
+		{"character_micros", &price.CharacterMicros},
 		{"min_charge", &price.MinCharge},
 	}
 	for _, field := range fields {
@@ -176,47 +207,79 @@ func priceFor(config QuotaConfig, model string) *Price {
 	return config.DefaultPrice
 }
 
-// chargeFor converts one request's usage into whole credits.
+// metered is everything about one request that a price might be applied to.
 //
-// `usageKnown` is false when the response carried no usage at all. That is
-// not an error and it is not free: a `requests` price still charges, which is
-// the whole point of having that unit. A `tokens` price cannot bill an
-// unknown token count, so it reports that nothing is chargeable and the
-// caller leaves the quota alone rather than deducting a guess.
-// chargeFor computes one request's charge.
+// It exists so that adding a unit does not add two more parameters to
+// chargeFor. Each quantity carries its own "known" flag rather than relying
+// on a zero value, because "the upstream reported zero" and "nothing was
+// reported" must lead to different outcomes: the first is a real bill of
+// zero, the second leaves the quota untouched.
+type metered struct {
+	tokens      tokenBreakdown
+	tokensKnown bool
+	// seconds comes from the response, like tokens do.
+	seconds      int64
+	secondsKnown bool
+	// characters comes from the REQUEST body, so it is known before the
+	// upstream answers -- and stays known even when the upstream fails,
+	// which is why succeeded still has to gate it.
+	characters      int64
+	charactersKnown bool
+	succeeded       bool
+}
+
+// chargeFor converts one request's metered usage into whole credits.
 //
-// `succeeded` only gates the per-request unit, and the asymmetry is
-// deliberate. A token price bills what was consumed, so a failed request
-// costs nothing on its own: there is no usage to multiply. That also means a
-// stream which answered, billed real tokens, and then broke stays charged --
-// the tokens were generated, and refunding them because the connection died
-// afterwards would be the wrong correction.
+// The second return value is "chargeable". False means this request must not
+// move the quota at all -- not that it is free. A `tokens` price cannot bill
+// a response that reported no usage, and a `characters` price cannot bill a
+// request whose text field was not found; in both cases deducting a guess
+// would be worse than deducting nothing.
 //
-// A per-request price has none of that protection. It bills the attempt, so
-// without this check an upstream 500 would deduct a full request's worth of
-// credits from the caller who received the error.
+// Status gates the two units that bill an ATTEMPT rather than a product:
 //
-// Not covered: an upstream that reports failure in the body of a 200. Nothing
-// here inspects the body's shape, so such a response is charged. That is a
-// real gap, left open rather than guessed at, because the shape differs per
-// provider and a heuristic that silently stops billing would be worse than
-// one that visibly over-bills.
-func chargeFor(price Price, usage tokenBreakdown, usageKnown bool, succeeded bool) (int64, bool, error) {
+//	requests    -- an upstream 500 would otherwise charge a full request.
+//	characters  -- the text was submitted but no audio came back.
+//
+// It deliberately does not gate `tokens` or `seconds`. Those bill what was
+// actually produced, so a stream that answered, billed real tokens and then
+// broke stays charged: the tokens were generated, and refunding them because
+// the connection died afterwards would be the wrong correction.
+//
+// Not covered: an upstream that reports failure in the body of a 200.
+// Nothing here inspects the body's shape, so such a response is charged.
+// That is a real gap, left open rather than guessed at, because the shape
+// differs per provider and a heuristic that silently stops billing would be
+// worse than one that visibly over-bills.
+func chargeFor(price Price, usage metered) (int64, bool, error) {
 	var micros int64
 	switch price.Unit {
 	case UnitRequests:
-		if !succeeded {
+		if !usage.succeeded {
 			return 0, false, nil
 		}
 		micros = price.RequestMicros
-	case UnitTokens:
-		if !usageKnown {
+	case UnitCharacters:
+		if !usage.charactersKnown {
 			return 0, false, nil
 		}
-		micros = usage.Input*price.InputMicros +
-			usage.Output*price.OutputMicros +
-			usage.CacheRead*price.CacheReadMicros +
-			usage.CacheWrite*price.CacheWriteMicros
+		if !usage.succeeded {
+			return 0, false, nil
+		}
+		micros = usage.characters * price.CharacterMicros
+	case UnitSeconds:
+		if !usage.secondsKnown {
+			return 0, false, nil
+		}
+		micros = usage.seconds * price.SecondMicros
+	case UnitTokens:
+		if !usage.tokensKnown {
+			return 0, false, nil
+		}
+		micros = usage.tokens.Input*price.InputMicros +
+			usage.tokens.Output*price.OutputMicros +
+			usage.tokens.CacheRead*price.CacheReadMicros +
+			usage.tokens.CacheWrite*price.CacheWriteMicros
 	default:
 		return 0, false, fmt.Errorf("unknown unit %q", price.Unit)
 	}
@@ -236,4 +299,66 @@ func chargeFor(price Price, usage tokenBreakdown, usageKnown bool, succeeded boo
 		return 0, false, fmt.Errorf("charge %d is out of range", credits)
 	}
 	return credits, true, nil
+}
+
+// countRequestCharacters measures the text a `characters` price bills for.
+//
+// It counts RUNES, not bytes. The gateway's traffic is largely Chinese, and
+// UTF-8 spends three bytes on each of those characters -- billing len() would
+// charge a Chinese sentence three times what the same sentence costs in
+// English, for identical synthesis work.
+//
+// The `false` return means no candidate field was present, which the caller
+// turns into "not chargeable" rather than into zero. See characterFields.
+func countRequestCharacters(body []byte) (int64, bool) {
+	for _, field := range characterFields {
+		value := gjson.GetBytes(body, field)
+		if !value.Exists() {
+			continue
+		}
+		// A provider that accepts an array of strings bills the whole batch.
+		if value.IsArray() {
+			var total int64
+			for _, element := range value.Array() {
+				total += int64(utf8.RuneCountInString(element.String()))
+			}
+			return total, true
+		}
+		if value.Type != gjson.String {
+			continue
+		}
+		return int64(utf8.RuneCountInString(value.String())), true
+	}
+	return 0, false
+}
+
+// responseSeconds reads the duration a `seconds` price bills for.
+//
+// Qwen3-ASR answers {"usage":{"type":"duration","seconds":1}}. The type is
+// checked rather than assumed: a provider reporting a different kind of
+// usage under the same key must not have its number billed as seconds.
+func responseSeconds(body []byte) (int64, bool) {
+	usage := gjson.GetBytes(body, "usage")
+	if !usage.Exists() {
+		return 0, false
+	}
+	if kind := usage.Get("type"); kind.Exists() && kind.String() != "duration" {
+		return 0, false
+	}
+	seconds := usage.Get("seconds")
+	if !seconds.Exists() || seconds.Type != gjson.Number {
+		return 0, false
+	}
+	// Durations are reported fractionally by some providers. A partial second
+	// is rounded UP: it consumed a second's worth of capacity, and rounding
+	// down would make every sub-second clip free.
+	value := seconds.Float()
+	if value < 0 {
+		return 0, false
+	}
+	rounded := int64(value)
+	if float64(rounded) < value {
+		rounded++
+	}
+	return rounded, true
 }
