@@ -183,10 +183,31 @@ func priceFor(config QuotaConfig, model string) *Price {
 // the whole point of having that unit. A `tokens` price cannot bill an
 // unknown token count, so it reports that nothing is chargeable and the
 // caller leaves the quota alone rather than deducting a guess.
-func chargeFor(price Price, usage tokenBreakdown, usageKnown bool) (int64, bool, error) {
+// chargeFor computes one request's charge.
+//
+// `succeeded` only gates the per-request unit, and the asymmetry is
+// deliberate. A token price bills what was consumed, so a failed request
+// costs nothing on its own: there is no usage to multiply. That also means a
+// stream which answered, billed real tokens, and then broke stays charged --
+// the tokens were generated, and refunding them because the connection died
+// afterwards would be the wrong correction.
+//
+// A per-request price has none of that protection. It bills the attempt, so
+// without this check an upstream 500 would deduct a full request's worth of
+// credits from the caller who received the error.
+//
+// Not covered: an upstream that reports failure in the body of a 200. Nothing
+// here inspects the body's shape, so such a response is charged. That is a
+// real gap, left open rather than guessed at, because the shape differs per
+// provider and a heuristic that silently stops billing would be worse than
+// one that visibly over-bills.
+func chargeFor(price Price, usage tokenBreakdown, usageKnown bool, succeeded bool) (int64, bool, error) {
 	var micros int64
 	switch price.Unit {
 	case UnitRequests:
+		if !succeeded {
+			return 0, false, nil
+		}
 		micros = price.RequestMicros
 	case UnitTokens:
 		if !usageKnown {

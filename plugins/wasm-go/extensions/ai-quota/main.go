@@ -31,6 +31,9 @@ const (
 	quotaUsageModelContextKey = "ai-quota-usage-model"
 	quotaRouteContextKey      = "ai-quota-route"
 	quotaClusterContextKey    = "ai-quota-cluster"
+	// quotaStatusContextKey holds the upstream's HTTP status. It decides
+	// whether a per-request price applies at all -- see chargeFor.
+	quotaStatusContextKey = "ai-quota-status"
 	// creditsLogKey is the field name this plugin contributes to the shared
 	// access-log object. It sits alongside the token counts ai-statistics
 	// writes, so one log line carries both what was used and what it cost.
@@ -68,6 +71,7 @@ func init() {
 		wrapper.ParseConfig(parseConfig),
 		wrapper.ProcessRequestHeaders(onHttpRequestHeaders),
 		wrapper.ProcessRequestBody(onHttpRequestBody),
+		wrapper.ProcessResponseHeaders(onHttpResponseHeaders),
 		wrapper.ProcessStreamingResponseBody(onHttpStreamingResponseBody),
 	)
 }
@@ -248,6 +252,38 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig) types
 	return types.HeaderStopAllIterationAndWatermark
 }
 
+// onHttpResponseHeaders records the upstream's status.
+//
+// The plugin has never needed it: under token pricing a failed request
+// reports no usage, so it costs nothing without anybody checking. A
+// per-request price has no such protection -- it charges for the attempt --
+// so the status has to be captured before the body callback wants it.
+func onHttpResponseHeaders(ctx wrapper.HttpContext, config QuotaConfig) types.Action {
+	status, err := proxywasm.GetHttpResponseHeader(":status")
+	if err != nil {
+		log.Warnf("no response status available: %v", err)
+		return types.ActionContinue
+	}
+	code, err := strconv.Atoi(strings.TrimSpace(status))
+	if err != nil {
+		log.Warnf("unreadable response status %q: %v", status, err)
+		return types.ActionContinue
+	}
+	ctx.SetContext(quotaStatusContextKey, code)
+	return types.ActionContinue
+}
+
+// responseSucceeded reports whether the upstream answered.
+//
+// An unknown status counts as a failure. The body callback only runs once
+// headers have been through this filter, so in practice the status is always
+// there; if it somehow is not, the safe reading of "we cannot tell whether
+// the caller got an answer" is not to bill them for it.
+func responseSucceeded(ctx wrapper.HttpContext) bool {
+	code, ok := ctx.GetContext(quotaStatusContextKey).(int)
+	return ok && code < 400
+}
+
 func onHttpRequestBody(ctx wrapper.HttpContext, config QuotaConfig, body []byte) types.Action {
 	log.Debugf("onHttpRequestBody()")
 	chatMode, ok := ctx.GetContext("chatMode").(ChatMode)
@@ -383,7 +419,7 @@ func chargeAmount(ctx wrapper.HttpContext, config QuotaConfig, model string) (in
 		return usage.total(), true
 	}
 
-	amount, chargeable, err := chargeFor(*price, usage, usageKnown)
+	amount, chargeable, err := chargeFor(*price, usage, usageKnown, responseSucceeded(ctx))
 	if err != nil {
 		// A charge that cannot be computed must not silently become zero: the
 		// request consumed real capacity. Leaving the quota untouched and
