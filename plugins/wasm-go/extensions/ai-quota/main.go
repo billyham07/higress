@@ -26,6 +26,11 @@ const (
 	quotaChargedContextKey = "ai-quota-charged"
 	quotaTerminalTailKey   = "ai-quota-terminal-tail"
 	quotaModelContextKey   = "ai-quota-model"
+	// quotaUsageModelContextKey holds the model the response reported, which
+	// is the label ai-statistics files its token counters under.
+	quotaUsageModelContextKey = "ai-quota-usage-model"
+	quotaRouteContextKey      = "ai-quota-route"
+	quotaClusterContextKey    = "ai-quota-cluster"
 	// creditsLogKey is the field name this plugin contributes to the shared
 	// access-log object. It sits alongside the token counts ai-statistics
 	// writes, so one log line carries both what was used and what it cost.
@@ -80,6 +85,11 @@ type QuotaConfig struct {
 	// unpriced and one token costs one unit -- the behaviour before credits.
 	DefaultPrice *Price           `yaml:"default_price"`
 	ModelPrices  map[string]Price `yaml:"model_prices"`
+	// counters caches the credit counters this rule has defined, keyed by the
+	// full metric name. Defining a counter twice is wasteful rather than
+	// wrong, but the cache is also what keeps the per-request path free of
+	// host calls once a (route, model, consumer) triple has been seen.
+	counters map[string]proxywasm.MetricCounter
 }
 
 type Consumer struct {
@@ -98,6 +108,7 @@ type RedisInfo struct {
 
 func parseConfig(json gjson.Result, config *QuotaConfig) error {
 	log.Debugf("parse config()")
+	config.counters = make(map[string]proxywasm.MetricCounter)
 	// admin
 	config.AdminPath = json.Get("admin_path").String()
 	config.AdminConsumer = json.Get("admin_consumer").String()
@@ -194,6 +205,9 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig) types
 	if model, err := proxywasm.GetHttpRequestHeader(modelHeader); err == nil {
 		context.SetContext(quotaModelContextKey, strings.TrimSpace(model))
 	}
+	route, cluster := routeAndCluster()
+	context.SetContext(quotaRouteContextKey, route)
+	context.SetContext(quotaClusterContextKey, cluster)
 	log.Debugf("chatMode:%s, adminMode:%s, consumer:%s", chatMode, adminMode, consumer)
 	if chatMode == ChatModeNone {
 		return types.ActionContinue
@@ -279,6 +293,9 @@ func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config QuotaConfig, da
 		if len(usage.InputTokenDetails) > 0 {
 			ctx.SetContext(tokenusage.CtxKeyInputTokenDetails, usage.InputTokenDetails)
 		}
+		if usage.Model != "" {
+			ctx.SetContext(quotaUsageModelContextKey, usage.Model)
+		}
 	}
 
 	// SSE clients often stop reading after a protocol-level terminal frame without
@@ -313,6 +330,7 @@ func chargeQuotaOnce(ctx wrapper.HttpContext, config QuotaConfig) {
 	}
 	ctx.SetContext(quotaChargedContextKey, true)
 	reportCharge(ctx, amount)
+	reportCreditsMetric(ctx, config, consumer, amount)
 }
 
 // reportCharge puts what was actually charged into the access log.
