@@ -25,6 +25,13 @@ const (
 	pluginName             = "ai-quota"
 	quotaChargedContextKey = "ai-quota-charged"
 	quotaTerminalTailKey   = "ai-quota-terminal-tail"
+	quotaModelContextKey   = "ai-quota-model"
+	// modelHeader is written by the model-router plugin, which runs in the
+	// AUTHN phase and therefore before this one. Reading the model from a
+	// header rather than from the request body keeps the completion path on
+	// DontReadRequestBody: buffering every prompt to learn one field would
+	// cost far more than the charge it enables.
+	modelHeader = "x-higress-llm-model"
 )
 
 type ChatMode string
@@ -64,6 +71,11 @@ type QuotaConfig struct {
 	EnablePathSuffixes []string          `yaml:"enable_path_suffixes"`
 	credential2Name    map[string]string `yaml:"-"`
 	redisClient        wrapper.RedisClient
+	// DefaultPrice applies to every model this route serves that has no entry
+	// of its own. Nil, together with an empty ModelPrices, means the route is
+	// unpriced and one token costs one unit -- the behaviour before credits.
+	DefaultPrice *Price           `yaml:"default_price"`
+	ModelPrices  map[string]Price `yaml:"model_prices"`
 }
 
 type Consumer struct {
@@ -150,6 +162,10 @@ func parseConfig(json gjson.Result, config *QuotaConfig) error {
 		Port: int64(servicePort),
 	})
 
+	if err := parsePrices(json, config); err != nil {
+		return err
+	}
+
 	return config.redisClient.Init(username, password, int64(timeout), wrapper.WithDataBase(database))
 }
 
@@ -171,6 +187,9 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig) types
 	context.SetContext("chatMode", chatMode)
 	context.SetContext("adminMode", adminMode)
 	context.SetContext("consumer", consumer)
+	if model, err := proxywasm.GetHttpRequestHeader(modelHeader); err == nil {
+		context.SetContext(quotaModelContextKey, strings.TrimSpace(model))
+	}
 	log.Debugf("chatMode:%s, adminMode:%s, consumer:%s", chatMode, adminMode, consumer)
 	if chatMode == ChatModeNone {
 		return types.ActionContinue
@@ -276,23 +295,82 @@ func chargeQuotaOnce(ctx wrapper.HttpContext, config QuotaConfig) {
 		return
 	}
 
-	totalToken, ok := getQuotaToken(
-		ctx.GetContext(tokenusage.CtxKeyTotalToken),
-		ctx.GetContext(tokenusage.CtxKeyInputToken),
-		ctx.GetContext(tokenusage.CtxKeyOutputToken),
-		ctx.GetContext(tokenusage.CtxKeyInputTokenDetails),
-	)
+	model := ctx.GetStringContext(quotaModelContextKey, "")
+	amount, ok := chargeAmount(ctx, config, model)
 	if !ok {
 		return
 	}
 
 	consumer := ctx.GetContext("consumer").(string)
-	log.Debugf("update consumer:%s, totalToken:%d", consumer, totalToken)
-	if err := config.redisClient.DecrBy(config.RedisKeyPrefix+consumer, int(totalToken), nil); err != nil {
+	log.Debugf("update consumer:%s, model:%s, charge:%d", consumer, model, amount)
+	if err := config.redisClient.DecrBy(config.RedisKeyPrefix+consumer, int(amount), nil); err != nil {
 		log.Errorf("failed to update consumer %s quota: %v", consumer, err)
 		return
 	}
 	ctx.SetContext(quotaChargedContextKey, true)
+}
+
+// chargeAmount is what this request costs, in whole credits.
+//
+// An unpriced route keeps the pre-credits behaviour exactly: the charge is
+// the token count. That is what makes this build safe to roll out ahead of
+// any price configuration -- a route whose config has not been touched
+// behaves as it did yesterday.
+func chargeAmount(ctx wrapper.HttpContext, config QuotaConfig, model string) (int64, bool) {
+	usage, usageKnown := usageBreakdown(ctx)
+
+	price := priceFor(config, model)
+	if price == nil {
+		if !usageKnown {
+			return 0, false
+		}
+		return usage.total(), true
+	}
+
+	amount, chargeable, err := chargeFor(*price, usage, usageKnown)
+	if err != nil {
+		// A charge that cannot be computed must not silently become zero: the
+		// request consumed real capacity. Leaving the quota untouched and
+		// saying so keeps the error recoverable by an operator.
+		log.Errorf("cannot price model %q: %v", model, err)
+		return 0, false
+	}
+	return amount, chargeable
+}
+
+// usageBreakdown recovers the four token components this request reported.
+//
+// The components are disjoint and summed, matching what getQuotaToken has
+// always done: Anthropic reports cache reads and cache creations alongside
+// input_tokens, not inside them.
+func usageBreakdown(ctx wrapper.HttpContext) (tokenBreakdown, bool) {
+	var usage tokenBreakdown
+	if details, ok := ctx.GetContext(tokenusage.CtxKeyInputTokenDetails).(map[string]int64); ok {
+		usage.CacheRead = details[tokenusage.InputTokenDetailsKeyAnthropicMessagesUsageCacheReadInputTokens]
+		usage.CacheWrite = details[tokenusage.InputTokenDetailsKeyAnthropicMessagesUsageCacheCreationInputTokens]
+	}
+
+	input, inputOK := ctx.GetContext(tokenusage.CtxKeyInputToken).(int64)
+	output, outputOK := ctx.GetContext(tokenusage.CtxKeyOutputToken).(int64)
+	if inputOK && outputOK {
+		usage.Input = input
+		usage.Output = output
+		return usage, true
+	}
+
+	// A provider that reports only a total leaves nothing to split. Billing
+	// the whole of it at the input rate is stated here rather than guessed at
+	// a call site, and it is logged, because a per-component price silently
+	// applied to an unsplit total is a wrong bill that looks like a right one.
+	if total, ok := ctx.GetContext(tokenusage.CtxKeyTotalToken).(int64); ok && total > 0 {
+		log.Warnf("usage reported as a total only; billing %d tokens at the input rate", total)
+		usage.Input = total - usage.CacheRead - usage.CacheWrite
+		if usage.Input < 0 {
+			usage.Input = 0
+		}
+		return usage, true
+	}
+	return usage, false
 }
 
 func getQuotaToken(totalTokenValue any, inputTokenValue any, outputTokenValue any, inputTokenDetailsValue ...any) (int64, bool) {

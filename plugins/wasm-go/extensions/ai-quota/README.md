@@ -37,6 +37,71 @@ description: AI 配额管理插件配置参考
 | database     | int    | 否   | 0                                                          | 使用的数据库id，例如配置为1，对应`SELECT 1`                                                  |
 
 
+## 积分计费（可选）
+
+Redis 里的计数器一直只有一个数字，请求把它减掉。积分改变的只是这个数字怎么算出来：不再是「一个 token 一个单位」，而是本次用量乘以该模型配置的价格。
+
+**不配 `default_price` 也不配 `model_prices` 时，行为和以前完全一致**（一个 token 扣一个单位）。因此这个版本可以先发布、后配价，没改过配置的路由不会有任何变化。
+
+模型名取自请求头 `x-higress-llm-model`，由 `model-router` 插件在 AUTHN 阶段写入，早于本插件。因此 completion 路径仍然不读请求体。
+
+| 名称 | 数据类型 | 填写要求 | 默认值 | 描述 |
+| --- | --- | --- | --- | --- |
+| `default_price` | object | 选填 | - | 本路由上所有没有单独定价的模型使用的价格 |
+| `model_prices` | object | 选填 | - | 以模型名为键的价格表，优先于 `default_price` |
+
+价格对象的字段：
+
+| 配置项 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `unit` | string | `tokens` | 计量单位：`tokens` 或 `requests` |
+| `per` | int | 1 | 一份费率覆盖多少个计量单位。按千 token 报价填 `1000` |
+| `input_micros` | int | 0 | 输入 token 费率，单位微积分（1e6 微积分 = 1 积分） |
+| `output_micros` | int | 0 | 输出 token 费率 |
+| `cache_read_micros` | int | 0 | 缓存命中 token 费率 |
+| `cache_write_micros` | int | 0 | 缓存写入 token 费率 |
+| `request_micros` | int | 0 | `unit: requests` 时，一次请求的费率 |
+| `min_charge` | int | 0 | 算下来不足 1 积分时的下限。默认 0，即费率为 0 就真的免费 |
+
+费率是**整数**的微积分数，配置和运算里都不出现浮点；小数费率会被拒绝而不是被截断成 0。四个 token 分量按互不重叠处理后相加，这与插件原有的口径一致（Anthropic 把 cache read / cache creation 报在 `input_tokens` 之外）。
+
+`unit: requests` 是给响应里根本没有用量的接口用的——按次计费，不需要把它硬掰成 token。`unit: tokens` 的模型如果拿不到用量，本次不扣，也不会扣一个猜出来的数。
+
+### 示例：百炼按模型定价，其余模型走路由默认价
+
+```yaml
+redis_key_prefix: "chat_quota:"
+admin_consumer: consumer3
+admin_path: /quota
+redis:
+  service_name: redis.dns
+  service_port: 6379
+  timeout: 2000
+default_price:
+  unit: tokens
+  per: 1000
+  input_micros: 1000000      # 1 积分 / 1000 输入 token
+  output_micros: 4000000     # 4 积分 / 1000 输出 token
+model_prices:
+  qwen3.7-max:
+    unit: tokens
+    per: 1000
+    input_micros: 2000000
+    output_micros: 8000000
+    cache_read_micros: 200000
+    cache_write_micros: 2500000
+```
+
+### 示例：自建算力，费率为零
+
+```yaml
+default_price:
+  unit: tokens
+  per: 1
+  # 四个费率都不填即为 0：这条路由上的模型不计费。
+  # 这是把意图写下来，而不是靠「不给这条路由挂插件」来表达。
+```
+
 ## 配置示例
 
 ### 识别请求参数 apikey，进行区别限流
