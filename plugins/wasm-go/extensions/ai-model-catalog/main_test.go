@@ -372,3 +372,135 @@ func errorType(t *testing.T, data []byte) string {
 	require.NoError(t, json.Unmarshal(data, &body))
 	return body.Error.Type
 }
+
+func TestCanonicalIDsHideBareAliases(t *testing.T) {
+	cfg := mustConfig(map[string]interface{}{
+		"created": 1700000000,
+		"models": []map[string]interface{}{
+			{"id": "h20/qwen3.5", "ownedBy": "yuexiu-private", "aliases": []string{"qwen3.5"}},
+		},
+		"consumers": map[string][]string{
+			"u-alice": {"h20/qwen3.5"},
+		},
+	})
+	test.RunTest(t, func(t *testing.T) {
+		host, status := test.NewTestHost(cfg)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+
+		host.InitHttp()
+		host.CallOnHttpRequestHeaders(requestHeaders("GET", "/v1/models", "u-alice"))
+		require.Equal(t, []string{"h20/qwen3.5"}, modelIDs(t, host.GetLocalResponse().Data))
+		host.CompleteHttp()
+
+		host.InitHttp()
+		host.CallOnHttpRequestHeaders(requestHeaders("GET", "/v1/models/qwen3.5", "u-alice"))
+		require.Equal(t, uint32(200), host.GetLocalResponse().StatusCode)
+		require.JSONEq(t,
+			`{"id":"h20/qwen3.5","object":"model","created":1700000000,"owned_by":"yuexiu-private"}`,
+			string(host.GetLocalResponse().Data))
+		host.CompleteHttp()
+	})
+}
+
+func TestUnifiedCatalogFailClosedWithoutGrants(t *testing.T) {
+	unifiedModels := []map[string]interface{}{
+		{"id": "h20/qwen3.5", "canonicalId": "h20/qwen3.5", "ownedBy": "higress-private", "aliases": []string{"qwen3.5"}},
+	}
+	test.RunTest(t, func(t *testing.T) {
+		t.Run("missing consumers denies", func(t *testing.T) {
+			host, status := test.NewTestHost(mustConfig(map[string]interface{}{
+				"version": "unified-model.v1",
+				"models":  unifiedModels,
+			}))
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+			host.InitHttp()
+			host.CallOnHttpRequestHeaders(requestHeaders("GET", "/v1/models", "u-alice"))
+			require.Equal(t, uint32(403), host.GetLocalResponse().StatusCode)
+			host.CompleteHttp()
+		})
+		t.Run("empty consumers denies", func(t *testing.T) {
+			host, status := test.NewTestHost(mustConfig(map[string]interface{}{
+				"version":   "unified-model.v1",
+				"models":    unifiedModels,
+				"consumers": map[string][]string{},
+			}))
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+			host.InitHttp()
+			host.CallOnHttpRequestHeaders(requestHeaders("GET", "/v1/models", "u-alice"))
+			require.Equal(t, uint32(403), host.GetLocalResponse().StatusCode)
+			host.CompleteHttp()
+		})
+		t.Run("malformed consumers denies", func(t *testing.T) {
+			host, status := test.NewTestHost(mustConfig(map[string]interface{}{
+				"version":   "unified-model.v1",
+				"models":    unifiedModels,
+				"consumers": []string{"u-alice"},
+			}))
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+			host.InitHttp()
+			host.CallOnHttpRequestHeaders(requestHeaders("GET", "/v1/models", "u-alice"))
+			require.Equal(t, uint32(403), host.GetLocalResponse().StatusCode)
+			host.CompleteHttp()
+		})
+	})
+}
+
+func TestUnifiedCatalogFailClosedWithoutModels(t *testing.T) {
+	test.RunTest(t, func(t *testing.T) {
+		t.Run("missing models denies", func(t *testing.T) {
+			host, status := test.NewTestHost(mustConfig(map[string]interface{}{
+				"version": "unified-model.v1",
+			}))
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+			host.InitHttp()
+			host.CallOnHttpRequestHeaders(requestHeaders("GET", "/v1/models", "u-alice"))
+			require.Equal(t, uint32(403), host.GetLocalResponse().StatusCode)
+			host.CompleteHttp()
+		})
+		t.Run("empty models denies", func(t *testing.T) {
+			host, status := test.NewTestHost(mustConfig(map[string]interface{}{
+				"version": "unified-model.v1",
+				"models":  []map[string]interface{}{},
+			}))
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+			host.InitHttp()
+			host.CallOnHttpRequestHeaders(requestHeaders("GET", "/v1/models", "u-alice"))
+			require.Equal(t, uint32(403), host.GetLocalResponse().StatusCode)
+			host.CompleteHttp()
+		})
+		t.Run("invalid version denies", func(t *testing.T) {
+			host, status := test.NewTestHost(mustConfig(map[string]interface{}{
+				"version":   "not-a-schema",
+				"models":    []map[string]interface{}{{"id": "qwen3.5"}},
+				"consumers": map[string][]string{"u-alice": {"qwen3.5"}},
+			}))
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+			host.InitHttp()
+			host.CallOnHttpRequestHeaders(requestHeaders("GET", "/v1/models", "u-alice"))
+			require.Equal(t, uint32(403), host.GetLocalResponse().StatusCode)
+			host.CompleteHttp()
+		})
+	})
+}
+
+func TestLegacyCatalogMissingConsumersDoesNotListAll(t *testing.T) {
+	test.RunTest(t, func(t *testing.T) {
+		host, status := test.NewTestHost(mustConfig(map[string]interface{}{
+			"models": []map[string]interface{}{{"id": "qwen3.5", "ownedBy": "yuexiu-private"}},
+		}))
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		host.InitHttp()
+		host.CallOnHttpRequestHeaders(requestHeaders("GET", "/v1/models", "u-alice"))
+		require.Equal(t, uint32(200), host.GetLocalResponse().StatusCode)
+		require.Equal(t, []string{}, modelIDs(t, host.GetLocalResponse().Data))
+		host.CompleteHttp()
+	})
+}

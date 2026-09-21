@@ -330,7 +330,9 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config KeyAuthConfig, log log
 		return deniedUnauthorizedConsumer()
 	}
 
-	proxywasm.AddHttpRequestHeader("X-Mse-Consumer", name)
+	_ = proxywasm.RemoveHttpRequestHeader("X-Mse-Consumer")
+	_ = proxywasm.RemoveHttpRequestHeader("x-mse-consumer")
+	_ = proxywasm.ReplaceHttpRequestHeader("X-Mse-Consumer", name)
 
 	// 全局生效：
 	// - global_auth == true 且 当前 domain/route 未配置该插件
