@@ -193,3 +193,89 @@ func TestCachedRequestIsBilledAtTheCacheRate(t *testing.T) {
 		t.Errorf("alongside charge = %d milli-credits, want %d", alongside, want)
 	}
 }
+
+// aiStatisticsCacheDetailInTotal is ai-statistics' own formula, transcribed
+// from its recordMetrics (the cache_detail_in_total_token counter):
+//
+//	if total > input+output {
+//	    detail := total - input - output
+//	    if observed := cached + cacheCreation; detail > observed { detail = observed }
+//	}
+//
+// It answers exactly the question billing needs answered -- how much of the
+// reported cache the provider counted OUTSIDE input+output -- which is why
+// splitTokens uses the same arithmetic instead of inventing its own.
+func aiStatisticsCacheDetailInTotal(details map[string]int64, input, output, total int64) int64 {
+	cached := firstPresent(details, cacheReadKeys)
+	cacheCreation := firstPresent(details, cacheCreationKeys)
+	if cached == 0 && cacheCreation == 0 {
+		return 0
+	}
+	if total <= input+output {
+		return 0
+	}
+	detail := total - input - output
+	if observed := cached + cacheCreation; detail > observed {
+		detail = observed
+	}
+	return detail
+}
+
+// Billing and statistics must describe the same request the same way. They run
+// in separate wasm VMs and cannot read each other's context, so the only thing
+// keeping them together is that both derive from the same details map with the
+// same arithmetic -- and this test, which recomputes ai-statistics' answer
+// independently and checks the split against it.
+//
+// The cache tokens NOT in that answer are the ones the provider counted inside
+// input, and those are exactly the ones billing has to move out of Input.
+func TestSplitAgreesWithAiStatisticsCacheAccounting(t *testing.T) {
+	tests := []struct {
+		name                 string
+		details              map[string]int64
+		input, output, total int64
+	}{{
+		name:    "alongside, cache read",
+		details: map[string]int64{"cache_read_input_tokens": 47_509, "cache_creation_input_tokens": 0},
+		input:   6, output: 226, total: 47_741,
+	}, {
+		name:    "alongside, cache creation",
+		details: map[string]int64{"cache_read_input_tokens": 0, "cache_creation_input_tokens": 55_480},
+		input:   2, output: 904, total: 56_386,
+	}, {
+		name:    "alongside, same cache under both names",
+		details: map[string]int64{"cached_tokens": 25_344, "cache_read_input_tokens": 25_344},
+		input:   11_943, output: 238, total: 37_525,
+	}, {
+		name:    "inside",
+		details: map[string]int64{"cached_tokens": 89_920},
+		input:   90_569, output: 76, total: 90_645,
+	}, {
+		name:    "inside, cache reported as zero",
+		details: map[string]int64{"cached_tokens": 0, "image_tokens": 5_040},
+		input:   5_938, output: 8_026, total: 13_964,
+	}}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			outside := aiStatisticsCacheDetailInTotal(test.details, test.input, test.output, test.total)
+			got := splitTokens(test.details, test.input, test.output, test.total)
+
+			// Everything ai-statistics did not count outside input+output was
+			// inside the input count, and billing must have removed exactly
+			// that much from Input.
+			reported := firstPresent(test.details, cacheReadKeys) + firstPresent(test.details, cacheCreationKeys)
+			wantRemoved := reported - outside
+			if removed := test.input - got.Input; removed != wantRemoved {
+				t.Errorf("billing removed %d tokens from input, but ai-statistics accounts for %d inside it",
+					removed, wantRemoved)
+			}
+
+			// And billing must price every cache token the provider reported,
+			// no more and no less.
+			if priced := got.CacheRead + got.CacheWrite; priced != reported {
+				t.Errorf("billing priced %d cache tokens, provider reported %d", priced, reported)
+			}
+		})
+	}
+}
