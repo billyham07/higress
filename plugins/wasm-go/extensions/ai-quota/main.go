@@ -559,11 +559,21 @@ func firstPresent(details map[string]int64, keys []string) int64 {
 // cache_detail_in_total_token metric: compare the reported total against
 // input + output. The response answers the question about itself.
 //
-// Verified against 100 production records carrying cache
-// (SLS cloudeyeforai/ai-accesslog, 2026-09-21..22) across /v1/chat/completions,
-// /bailian/v1/chat/completions and /bailian/v1/v1/messages: where total
-// exceeded input+output the excess equalled the reported cache counts exactly,
-// and where it did not the cache was inside input. 100/100.
+// Verified against 66 production records that actually carried cache
+// (SLS cloudeyeforai/ai-accesslog, 24h to 2026-09-22) across
+// /v1/chat/completions, /bailian/v1/chat/completions and /v1/messages:
+// 56 inside, 10 alongside, 0 disagreements. Where total exceeded
+// input+output the excess equalled the reported cache exactly; where it did
+// not, the cache was inside input.
+//
+// Note what firstPresent buys here: 3 of those records reported the SAME
+// cache under both names at once, e.g.
+//
+//	{"cache_read_input_tokens":25344,"cached_tokens":25344}
+//
+// Summing the keys would have doubled that request's cache. Taking the first
+// key present -- which is what ai-statistics' getTokenDetailMetric does --
+// reads it once.
 func splitTokens(details map[string]int64, input, output, total int64) tokenBreakdown {
 	usage := tokenBreakdown{Input: input, Output: output}
 	cacheRead := firstPresent(details, cacheReadKeys)

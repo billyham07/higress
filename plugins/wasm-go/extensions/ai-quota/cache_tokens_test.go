@@ -14,7 +14,8 @@ import "testing"
 //
 // Every case below is a real record. Production ones are from SLS
 // cloudeyeforai/ai-accesslog and test ones from ai-accesslog-test, 2026-09-20
-// to 2026-09-22.
+// to 2026-09-22. Of 66 production records that actually carried cache,
+// 56 were the inside shape and 10 alongside, with no disagreements.
 func TestSplitTokensSeparatesCacheFromInput(t *testing.T) {
 	tests := []struct {
 		name                 string
@@ -74,6 +75,16 @@ func TestSplitTokensSeparatesCacheFromInput(t *testing.T) {
 		input:   1_200, output: 30, total: 1_230,
 		want: tokenBreakdown{Input: 0, Output: 30, CacheRead: 1_200},
 	}, {
+		// glm-5.2 on /bailian/v1/v1/messages, production: the SAME cache
+		// reported under both names at once. Summing them would double this
+		// request's cache; taking the first key present reads it once.
+		// 11943 + 238 = 12181, and 37525 - 12181 = 25344 -- one cache read,
+		// counted alongside input.
+		name:    "the same cache reported under both names is counted once",
+		details: map[string]int64{"cached_tokens": 25_344, "cache_read_input_tokens": 25_344, "cache_creation_input_tokens": 0},
+		input:   11_943, output: 238, total: 37_525,
+		want: tokenBreakdown{Input: 11_943, Output: 238, CacheRead: 25_344},
+	}, {
 		// A total inflated beyond what the cache detail explains must not
 		// manufacture cache tokens: the excess is clamped to what was
 		// actually reported, as ai-statistics clamps cacheDetailInTotal.
@@ -118,6 +129,10 @@ func TestSplitTokensConservesTheReportedTotal(t *testing.T) {
 		name:    "no cache",
 		details: map[string]int64{},
 		input:   5_938, output: 8_026, total: 13_964,
+	}, {
+		name:    "both key names for one cache",
+		details: map[string]int64{"cached_tokens": 25_344, "cache_read_input_tokens": 25_344},
+		input:   11_943, output: 238, total: 37_525,
 	}, {
 		// Even when the provider contradicts itself, the bill must not
 		// exceed the tokens it reported.
