@@ -520,35 +520,130 @@ func meteredUsage(ctx wrapper.HttpContext) metered {
 	return usage
 }
 
+// Cache token detail keys, in the same order and with the same meaning
+// ai-statistics uses for its cached_token / cache_creation_input_token
+// metrics. The names are the provider's own: ExtractInputTokenDetails copies
+// `prompt_tokens_details` into the map verbatim, so a key is whatever the
+// upstream called it.
+var (
+	cacheReadKeys     = []string{"cached_tokens", "cache_read_input_tokens", "cached_content_token_count"}
+	cacheCreationKeys = []string{"cache_creation_input_tokens"}
+)
+
+// firstPresent returns the first key that exists, matching getTokenDetailMetric:
+// presence, not a non-zero value, is what selects a key. A provider reporting
+// cached_tokens: 0 has answered the question.
+func firstPresent(details map[string]int64, keys []string) int64 {
+	for _, key := range keys {
+		if value, ok := details[key]; ok && value >= 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+// splitTokens turns a reported usage into the four DISJOINT components a price
+// is applied to.
+//
+// The one thing that decides the bill here is whether the provider's cache
+// count is already inside the input count, and providers disagree:
+//
+//	Anthropic   cache_read_input_tokens sits ALONGSIDE input_tokens
+//	            (total = input + output + cache)
+//	OpenAI      cached_tokens is INSIDE prompt_tokens
+//	            (total = prompt + completion, cache in neither sum)
+//
+// Both shapes reach the same model here, so the distinction cannot be drawn
+// per model or per route -- and it is not drawn by key name either. It uses
+// the arithmetic ai-statistics already settled on for its
+// cache_detail_in_total_token metric: compare the reported total against
+// input + output. The response answers the question about itself.
+//
+// Verified against 100 production records carrying cache
+// (SLS cloudeyeforai/ai-accesslog, 2026-09-21..22) across /v1/chat/completions,
+// /bailian/v1/chat/completions and /bailian/v1/v1/messages: where total
+// exceeded input+output the excess equalled the reported cache counts exactly,
+// and where it did not the cache was inside input. 100/100.
+func splitTokens(details map[string]int64, input, output, total int64) tokenBreakdown {
+	usage := tokenBreakdown{Input: input, Output: output}
+	cacheRead := firstPresent(details, cacheReadKeys)
+	cacheCreation := firstPresent(details, cacheCreationKeys)
+	if cacheRead == 0 && cacheCreation == 0 {
+		return usage
+	}
+
+	// How much of the cache the provider counted OUTSIDE input+output. Clamped
+	// to what was actually reported, exactly as ai-statistics clamps
+	// cacheDetailInTotal, so a total inflated for any other reason cannot
+	// manufacture cache tokens.
+	alongside := int64(0)
+	if total > input+output {
+		alongside = total - input - output
+		if observed := cacheRead + cacheCreation; alongside > observed {
+			alongside = observed
+		}
+	}
+
+	// Anything the provider did NOT count outside is inside the input count,
+	// and has to be moved out of it so it is billed once, at the cache rate.
+	inside := cacheRead + cacheCreation - alongside
+	if inside > usage.Input {
+		// More cache than the prompt it is supposedly part of is a provider
+		// bug. Never drive input negative, and never bill cache tokens the
+		// prompt cannot contain: drop the excess, reads first, so the whole
+		// prompt is billed exactly once at the cache rate.
+		excess := inside - usage.Input
+		inside = usage.Input
+		if cacheRead >= excess {
+			cacheRead -= excess
+		} else {
+			cacheCreation -= excess - cacheRead
+			cacheRead = 0
+		}
+		if cacheCreation < 0 {
+			cacheCreation = 0
+		}
+	}
+	usage.Input -= inside
+
+	// Both components bill in full at their own rate. Moving tokens out of
+	// Input above only removed the double count; it never changed how much
+	// cache there was.
+	usage.CacheRead = cacheRead
+	usage.CacheWrite = cacheCreation
+	return usage
+}
+
 // tokenUsage recovers the four token components this request reported.
 func tokenUsage(ctx wrapper.HttpContext) (tokenBreakdown, bool) {
-	var usage tokenBreakdown
-	if details, ok := ctx.GetContext(tokenusage.CtxKeyInputTokenDetails).(map[string]int64); ok {
-		usage.CacheRead = details[tokenusage.InputTokenDetailsKeyAnthropicMessagesUsageCacheReadInputTokens]
-		usage.CacheWrite = details[tokenusage.InputTokenDetailsKeyAnthropicMessagesUsageCacheCreationInputTokens]
-	}
+	details, _ := ctx.GetContext(tokenusage.CtxKeyInputTokenDetails).(map[string]int64)
+	total, totalOK := ctx.GetContext(tokenusage.CtxKeyTotalToken).(int64)
 
 	input, inputOK := ctx.GetContext(tokenusage.CtxKeyInputToken).(int64)
 	output, outputOK := ctx.GetContext(tokenusage.CtxKeyOutputToken).(int64)
 	if inputOK && outputOK {
-		usage.Input = input
-		usage.Output = output
-		return usage, true
+		if !totalOK {
+			// No total to compare against, so the arithmetic cannot say which
+			// shape this is. Assume the cache is inside input, which is the
+			// common shape and the one that bills LESS: a wrong guess here
+			// undercharges rather than double-charges a discounted token.
+			total = input + output
+		}
+		return splitTokens(details, input, output, total), true
 	}
 
 	// A provider that reports only a total leaves nothing to split. Billing
 	// the whole of it at the input rate is stated here rather than guessed at
 	// a call site, and it is logged, because a per-component price silently
 	// applied to an unsplit total is a wrong bill that looks like a right one.
-	if total, ok := ctx.GetContext(tokenusage.CtxKeyTotalToken).(int64); ok && total > 0 {
+	if totalOK && total > 0 {
 		log.Warnf("usage reported as a total only; billing %d tokens at the input rate", total)
-		usage.Input = total - usage.CacheRead - usage.CacheWrite
-		if usage.Input < 0 {
-			usage.Input = 0
-		}
-		return usage, true
+		// Passing total as both the input and the total makes the rule read
+		// "no excess outside input", so any reported cache is taken out of
+		// the total and billed at the cache rate instead of the input rate.
+		return splitTokens(details, total, 0, total), true
 	}
-	return usage, false
+	return tokenBreakdown{}, false
 }
 
 func getQuotaToken(totalTokenValue any, inputTokenValue any, outputTokenValue any, inputTokenDetailsValue ...any) (int64, bool) {

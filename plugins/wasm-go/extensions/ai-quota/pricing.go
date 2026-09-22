@@ -111,10 +111,23 @@ type Price struct {
 	MinChargeMillis int64
 }
 
-// tokenBreakdown is one request's metered token usage. The four fields are
-// treated as disjoint and summed, which is the convention getQuotaToken
-// already uses: Anthropic reports cache reads and cache creations alongside
-// input_tokens rather than inside it.
+// tokenBreakdown is one request's metered token usage, in four DISJOINT
+// components. chargeFor multiplies each by its own rate and sums, so a token
+// counted in two of them is billed twice, and one dropped between them is
+// billed at the wrong rate.
+//
+// Disjointness is not a property of the provider's response -- it is produced
+// by splitTokens, because providers disagree:
+//
+//	Anthropic   usage.cache_read_input_tokens sits ALONGSIDE input_tokens
+//	            (total = input + output + cache).
+//	OpenAI      prompt_tokens_details.cached_tokens is INSIDE prompt_tokens
+//	            (total = prompt + completion, cache counted in neither sum).
+//
+// Both shapes arrive on the same model here: glm-5.3-flash serves /messages
+// and /completions, and a 100-request sample held 70 of the second shape and
+// 2 of the first. So the distinction has to be drawn per response, by key --
+// never per model or per route.
 type tokenBreakdown struct {
 	Input      int64
 	Output     int64
