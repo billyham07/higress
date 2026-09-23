@@ -30,7 +30,7 @@ func TestTheChargeIsExportedAsAGatewayCounter(t *testing.T) {
 			{"x-mse-consumer", "consumer1"},
 			{"x-higress-llm-model", "glm-5.2"},
 		})
-		host.CallOnRedisCall(0, test.CreateRedisResp(1000000))
+		admitFunded(host)
 		host.CallOnHttpRequestBody([]byte(`{"stream":true}`))
 		host.CallOnHttpStreamingResponseBody(
 			[]byte(`data: {"model":"glm-5.2","choices":[],"usage":{"prompt_tokens":10000,"completion_tokens":2000,"total_tokens":12000}}`), false)
@@ -63,7 +63,7 @@ func TestAFreeRequestDefinesNoCounter(t *testing.T) {
 			{"x-mse-consumer", "consumer1"},
 			{"x-higress-llm-model", "qwen3-vl-8b"},
 		})
-		host.CallOnRedisCall(0, test.CreateRedisResp(1000000))
+		admitFunded(host)
 		host.CallOnHttpRequestBody([]byte(`{"stream":true}`))
 		host.CallOnHttpStreamingResponseBody(
 			[]byte(`data: {"model":"qwen3-vl-8b","choices":[],"usage":{"prompt_tokens":10000,"completion_tokens":2000,"total_tokens":12000}}`), false)
@@ -103,7 +103,7 @@ func TestTheCounterUsesTheModelTheResponseReported(t *testing.T) {
 			{"x-mse-consumer", "consumer1"},
 			{"x-higress-llm-model", "qwen3.5"},
 		})
-		host.CallOnRedisCall(0, test.CreateRedisResp(1000000))
+		admitFunded(host)
 		host.CallOnHttpRequestBody([]byte(`{"stream":true}`))
 		host.CallOnHttpStreamingResponseBody(
 			[]byte(`data: {"model":"qwen3.5-max-2026-09-01","choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":0,"total_tokens":1000}}`), false)

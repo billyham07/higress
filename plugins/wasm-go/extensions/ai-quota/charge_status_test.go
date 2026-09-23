@@ -33,7 +33,7 @@ func TestAPerRequestPriceChargesASuccessfulCall(t *testing.T) {
 			{":method", "POST"},
 			{"x-mse-consumer", "consumer1"},
 		})
-		host.CallOnRedisCall(0, test.CreateRedisResp(1000000))
+		admitFunded(host)
 		host.CallOnHttpRequestBody([]byte(`{}`))
 		host.CallOnHttpResponseHeaders([][2]string{{":status", "200"}})
 		// No usage anywhere: that is the point of a per-request price.
@@ -60,7 +60,7 @@ func TestAPerRequestPriceDoesNotChargeAFailedCall(t *testing.T) {
 					{":method", "POST"},
 					{"x-mse-consumer", "consumer1"},
 				})
-				host.CallOnRedisCall(0, test.CreateRedisResp(1000000))
+				admitFunded(host)
 				host.CallOnHttpRequestBody([]byte(`{}`))
 				host.CallOnHttpResponseHeaders([][2]string{{":status", status}})
 				host.CallOnHttpStreamingResponseBody([]byte(`{"error":{"message":"upstream failed"}}`), true)
@@ -93,7 +93,7 @@ func TestATokenPriceIsUnaffectedByTheStatusGate(t *testing.T) {
 			{"x-mse-consumer", "consumer1"},
 			{"x-higress-llm-model", "glm-5.2"},
 		})
-		host.CallOnRedisCall(0, test.CreateRedisResp(1000000))
+		admitFunded(host)
 		host.CallOnHttpRequestBody([]byte(`{"stream":true}`))
 		// The upstream answered, generated real tokens, then the stream broke.
 		// The tokens were produced; refunding them because the connection died

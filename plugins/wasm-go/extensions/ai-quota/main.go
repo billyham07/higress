@@ -2,9 +2,7 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -16,7 +14,6 @@ import (
 	"github.com/higress-group/wasm-go/pkg/tokenusage"
 	"github.com/higress-group/wasm-go/pkg/wrapper"
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/resp"
 
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-quota/util"
 )
@@ -64,18 +61,10 @@ type ChatMode string
 
 const (
 	ChatModeCompletion ChatMode = "completion"
-	ChatModeAdmin      ChatMode = "admin"
 	ChatModeNone       ChatMode = "none"
 )
 
-type AdminMode string
-
-const (
-	AdminModeRefresh AdminMode = "refresh"
-	AdminModeQuery   AdminMode = "query"
-	AdminModeDelta   AdminMode = "delta"
-	AdminModeNone    AdminMode = "none"
-)
+var errNoCreditOwner = errors.New("request was not admitted against a credit wallet")
 
 func main() {}
 
@@ -91,12 +80,8 @@ func init() {
 }
 
 type QuotaConfig struct {
-	redisInfo          RedisInfo         `yaml:"redis"`
-	RedisKeyPrefix     string            `yaml:"redis_key_prefix"`
-	AdminConsumer      string            `yaml:"admin_consumer"`
-	AdminPath          string            `yaml:"admin_path"`
-	EnablePathSuffixes []string          `yaml:"enable_path_suffixes"`
-	credential2Name    map[string]string `yaml:"-"`
+	redisInfo          RedisInfo `yaml:"redis"`
+	EnablePathSuffixes []string  `yaml:"enable_path_suffixes"`
 	redisClient        wrapper.RedisClient
 	// DefaultPrice applies to every model this route serves that has no entry
 	// of its own. Nil, together with an empty ModelPrices, means the route is
@@ -149,12 +134,6 @@ type RedisInfo struct {
 func parseConfig(json gjson.Result, config *QuotaConfig) error {
 	log.Debugf("parse config()")
 	config.counters = make(map[string]proxywasm.MetricCounter)
-	// admin
-	config.AdminPath = json.Get("admin_path").String()
-	config.AdminConsumer = json.Get("admin_consumer").String()
-	if config.AdminPath == "" {
-		config.AdminPath = "/quota"
-	}
 	suffixResult := json.Get("enable_path_suffixes")
 	if !suffixResult.Exists() {
 		config.EnablePathSuffixes = []string{"/v1/chat/completions", "/v1/messages"}
@@ -174,14 +153,7 @@ func parseConfig(json gjson.Result, config *QuotaConfig) error {
 	if len(config.EnablePathSuffixes) == 0 {
 		return errors.New("enable_path_suffixes must not be empty")
 	}
-	if config.AdminConsumer == "" {
-		return errors.New("missing admin_consumer in config")
-	}
 	// Redis
-	config.RedisKeyPrefix = json.Get("redis_key_prefix").String()
-	if config.RedisKeyPrefix == "" {
-		config.RedisKeyPrefix = "chat_quota:"
-	}
 	redisConfig := json.Get("redis")
 	if !redisConfig.Exists() {
 		return errors.New("missing redis in config")
@@ -238,9 +210,8 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig) types
 
 	rawPath := context.Path()
 	path, _ := url.Parse(rawPath)
-	chatMode, adminMode := getOperationMode(path.Path, config.AdminPath, config.EnablePathSuffixes)
+	chatMode := getOperationMode(path.Path, config.EnablePathSuffixes)
 	context.SetContext("chatMode", chatMode)
-	context.SetContext("adminMode", adminMode)
 	context.SetContext("consumer", consumer)
 	if model, err := proxywasm.GetHttpRequestHeader(modelHeader); err == nil {
 		context.SetContext(quotaModelContextKey, strings.TrimSpace(model))
@@ -248,19 +219,8 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig) types
 	route, cluster := routeAndCluster()
 	context.SetContext(quotaRouteContextKey, route)
 	context.SetContext(quotaClusterContextKey, cluster)
-	log.Debugf("chatMode:%s, adminMode:%s, consumer:%s", chatMode, adminMode, consumer)
+	log.Debugf("chatMode:%s, consumer:%s", chatMode, consumer)
 	if chatMode == ChatModeNone {
-		return types.ActionContinue
-	}
-	if chatMode == ChatModeAdmin {
-		// query quota
-		if adminMode == AdminModeQuery {
-			return queryQuota(context, config, consumer, path)
-		}
-		if adminMode == AdminModeRefresh || adminMode == AdminModeDelta {
-			context.BufferRequestBody()
-			return types.HeaderStopIteration
-		}
 		return types.ActionContinue
 	}
 
@@ -272,25 +232,11 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig) types
 	} else {
 		context.DontReadRequestBody()
 	}
-	// check quota here
-	config.redisClient.Get(config.RedisKeyPrefix+consumer, func(response resp.Value) {
-		isDenied := false
-		if err := response.Error(); err != nil {
-			isDenied = true
-		}
-		if response.IsNull() {
-			isDenied = true
-		}
-		if response.Integer() <= 0 {
-			isDenied = true
-		}
-		log.Debugf("get consumer:%s quota:%d isDenied:%t", consumer, response.Integer(), isDenied)
-		if isDenied {
-			util.SendResponse(http.StatusForbidden, "ai-quota.noquota", "text/plain", "Request denied by ai quota check, No quota left")
-			return
-		}
-		proxywasm.ResumeHttpRequest()
-	})
+	if err := admitCredits(context, config, consumer); err != nil {
+		log.Errorf("failed to read credit key for %s: %v", consumer, err)
+		deniedNoCreditAccount()
+		return types.ActionContinue
+	}
 	return types.HeaderStopAllIterationAndWatermark
 }
 
@@ -329,40 +275,18 @@ func responseSucceeded(ctx wrapper.HttpContext) bool {
 func onHttpRequestBody(ctx wrapper.HttpContext, config QuotaConfig, body []byte) types.Action {
 	log.Debugf("onHttpRequestBody()")
 	chatMode, ok := ctx.GetContext("chatMode").(ChatMode)
-	if !ok {
+	if !ok || chatMode != ChatModeCompletion {
 		return types.ActionContinue
 	}
-	if chatMode == ChatModeCompletion {
-		// Only reached when metersCharacters() asked for the body.
-		if characters, ok := countRequestCharacters(body); ok {
-			ctx.SetContext(quotaCharactersContextKey, characters)
-		} else {
-			// Left unset on purpose: chargeFor treats an unknown count as
-			// "do not touch the quota", which surfaces a field-name
-			// mismatch instead of silently synthesising free requests.
-			log.Warnf("per-character pricing found no %v field in the request body", characterFields)
-		}
-		return types.ActionContinue
+	// Only reached when metersCharacters() asked for the body.
+	if characters, ok := countRequestCharacters(body); ok {
+		ctx.SetContext(quotaCharactersContextKey, characters)
+	} else {
+		// Left unset on purpose: chargeFor treats an unknown count as
+		// "do not touch the quota", which surfaces a field-name
+		// mismatch instead of silently synthesising free requests.
+		log.Warnf("per-character pricing found no %v field in the request body", characterFields)
 	}
-	if chatMode == ChatModeNone {
-		return types.ActionContinue
-	}
-	adminMode, ok := ctx.GetContext("adminMode").(AdminMode)
-	if !ok {
-		return types.ActionContinue
-	}
-	adminConsumer, ok := ctx.GetContext("consumer").(string)
-	if !ok {
-		return types.ActionContinue
-	}
-
-	if adminMode == AdminModeRefresh {
-		return refreshQuota(ctx, config, adminConsumer, string(body))
-	}
-	if adminMode == AdminModeDelta {
-		return deltaQuota(ctx, config, adminConsumer, string(body))
-	}
-
 	return types.ActionContinue
 }
 
@@ -371,7 +295,7 @@ func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config QuotaConfig, da
 	if !ok {
 		return data
 	}
-	if chatMode == ChatModeNone || chatMode == ChatModeAdmin {
+	if chatMode != ChatModeCompletion {
 		return data
 	}
 	usage := tokenusage.GetTokenUsage(ctx, data)
@@ -423,8 +347,8 @@ func chargeQuotaOnce(ctx wrapper.HttpContext, config QuotaConfig) {
 
 	consumer := ctx.GetContext("consumer").(string)
 	log.Debugf("update consumer:%s, model:%s, charge:%d", consumer, model, amount)
-	if err := config.redisClient.DecrBy(config.RedisKeyPrefix+consumer, int(amount), nil); err != nil {
-		log.Errorf("failed to update consumer %s quota: %v", consumer, err)
+	if err := spendCredits(ctx, config, consumer, amount); err != nil {
+		log.Errorf("failed to charge consumer %s: %v", consumer, err)
 		return
 	}
 	ctx.SetContext(quotaChargedContextKey, true)
@@ -762,150 +686,11 @@ func deniedUnauthorizedConsumer() types.Action {
 	return types.ActionContinue
 }
 
-func getOperationMode(path string, adminPath string, pathSuffixes []string) (ChatMode, AdminMode) {
-	fullAdminPath := "/v1/chat/completions" + adminPath
-	if strings.HasSuffix(path, fullAdminPath+"/refresh") {
-		return ChatModeAdmin, AdminModeRefresh
-	}
-	if strings.HasSuffix(path, fullAdminPath+"/delta") {
-		return ChatModeAdmin, AdminModeDelta
-	}
-	if strings.HasSuffix(path, fullAdminPath) {
-		return ChatModeAdmin, AdminModeQuery
-	}
+func getOperationMode(path string, pathSuffixes []string) ChatMode {
 	for _, suffix := range pathSuffixes {
 		if strings.HasSuffix(path, suffix) {
-			return ChatModeCompletion, AdminModeNone
+			return ChatModeCompletion
 		}
 	}
-	return ChatModeNone, AdminModeNone
-}
-
-func refreshQuota(ctx wrapper.HttpContext, config QuotaConfig, adminConsumer string, body string) types.Action {
-	// check consumer
-	if adminConsumer != config.AdminConsumer {
-		util.SendResponse(http.StatusForbidden, "ai-quota.unauthorized", "text/plain", "Request denied by ai quota check. Unauthorized admin consumer.")
-		return types.ActionContinue
-	}
-
-	queryValues, _ := url.ParseQuery(body)
-	values := make(map[string]string, len(queryValues))
-	for k, v := range queryValues {
-		values[k] = v[0]
-	}
-	queryConsumer := values["consumer"]
-	quota, err := strconv.Atoi(values["quota"])
-	if queryConsumer == "" || err != nil {
-		util.SendResponse(http.StatusForbidden, "ai-quota.unauthorized", "text/plain", "Request denied by ai quota check. consumer can't be empty and quota must be integer.")
-		return types.ActionContinue
-	}
-	err2 := config.redisClient.Set(config.RedisKeyPrefix+queryConsumer, quota, func(response resp.Value) {
-		log.Debugf("Redis set key = %s quota = %d", config.RedisKeyPrefix+queryConsumer, quota)
-		if err := response.Error(); err != nil {
-			util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
-			return
-		}
-		util.SendResponse(http.StatusOK, "ai-quota.refreshquota", "text/plain", "refresh quota successful")
-	})
-
-	if err2 != nil {
-		util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
-		return types.ActionContinue
-	}
-
-	return types.ActionPause
-}
-
-func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, adminConsumer string, url *url.URL) types.Action {
-	// check consumer
-	if adminConsumer != config.AdminConsumer {
-		util.SendResponse(http.StatusForbidden, "ai-quota.unauthorized", "text/plain", "Request denied by ai quota check. Unauthorized admin consumer.")
-		return types.ActionContinue
-	}
-	// check url
-	queryValues := url.Query()
-	values := make(map[string]string, len(queryValues))
-	for k, v := range queryValues {
-		values[k] = v[0]
-	}
-	if values["consumer"] == "" {
-		util.SendResponse(http.StatusForbidden, "ai-quota.unauthorized", "text/plain", "Request denied by ai quota check. consumer can't be empty.")
-		return types.ActionContinue
-	}
-	queryConsumer := values["consumer"]
-	err := config.redisClient.Get(config.RedisKeyPrefix+queryConsumer, func(response resp.Value) {
-		quota := 0
-		if err := response.Error(); err != nil {
-			util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
-			return
-		} else if response.IsNull() {
-			quota = 0
-		} else {
-			quota = response.Integer()
-		}
-		result := struct {
-			Consumer string `json:"consumer"`
-			Quota    int    `json:"quota"`
-		}{
-			Consumer: queryConsumer,
-			Quota:    quota,
-		}
-		body, _ := json.Marshal(result)
-		util.SendResponse(http.StatusOK, "ai-quota.queryquota", "application/json", string(body))
-	})
-	if err != nil {
-		util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
-		return types.ActionContinue
-	}
-	return types.ActionPause
-}
-
-func deltaQuota(ctx wrapper.HttpContext, config QuotaConfig, adminConsumer string, body string) types.Action {
-	// check consumer
-	if adminConsumer != config.AdminConsumer {
-		util.SendResponse(http.StatusForbidden, "ai-quota.unauthorized", "text/plain", "Request denied by ai quota check. Unauthorized admin consumer.")
-		return types.ActionContinue
-	}
-
-	queryValues, _ := url.ParseQuery(body)
-	values := make(map[string]string, len(queryValues))
-	for k, v := range queryValues {
-		values[k] = v[0]
-	}
-	queryConsumer := values["consumer"]
-	value, err := strconv.Atoi(values["value"])
-	if queryConsumer == "" || err != nil {
-		util.SendResponse(http.StatusForbidden, "ai-quota.unauthorized", "text/plain", "Request denied by ai quota check. consumer can't be empty and value must be integer.")
-		return types.ActionContinue
-	}
-
-	if value >= 0 {
-		err := config.redisClient.IncrBy(config.RedisKeyPrefix+queryConsumer, value, func(response resp.Value) {
-			log.Debugf("Redis Incr key = %s value = %d", config.RedisKeyPrefix+queryConsumer, value)
-			if err := response.Error(); err != nil {
-				util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
-				return
-			}
-			util.SendResponse(http.StatusOK, "ai-quota.deltaquota", "text/plain", "delta quota successful")
-		})
-		if err != nil {
-			util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
-			return types.ActionContinue
-		}
-	} else {
-		err := config.redisClient.DecrBy(config.RedisKeyPrefix+queryConsumer, 0-value, func(response resp.Value) {
-			log.Debugf("Redis Decr key = %s value = %d", config.RedisKeyPrefix+queryConsumer, 0-value)
-			if err := response.Error(); err != nil {
-				util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
-				return
-			}
-			util.SendResponse(http.StatusOK, "ai-quota.deltaquota", "text/plain", "delta quota successful")
-		})
-		if err != nil {
-			util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
-			return types.ActionContinue
-		}
-	}
-
-	return types.ActionPause
+	return ChatModeNone
 }

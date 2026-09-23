@@ -12,9 +12,6 @@ import (
 
 func priceConfig(extra map[string]interface{}) json.RawMessage {
 	base := map[string]interface{}{
-		"admin_consumer":       "admin",
-		"redis_key_prefix":     "chat_quota:",
-		"admin_path":           "/quota",
 		"enable_path_suffixes": []string{"/v1/chat/completions", "/v1/messages", "/v1/responses"},
 		"redis": map[string]interface{}{
 			"service_name": "redis.static",
@@ -30,24 +27,19 @@ func priceConfig(extra map[string]interface{}) json.RawMessage {
 	return data
 }
 
-// decrByArguments isolates what a DECRBY actually asked for, so a test cannot
-// pass because the amount it wanted happened to appear elsewhere in the
-// serialized command.
-func decrByArguments(t *testing.T, query string) string {
+// chargeArguments isolates what the charge script was asked to spend, so a
+// test cannot pass by finding the expected digits somewhere else in the
+// encoded script. The command is RESP: a length header precedes every bulk
+// string, and the last three payloads are the two keys and the amount.
+func chargeArguments(t *testing.T, query string) string {
 	t.Helper()
-	index := strings.Index(strings.ToLower(query), "decrby")
-	require.GreaterOrEqual(t, index, 0, "expected a DECRBY, got %q", query)
-	var args []string
-	for _, field := range strings.Fields(query[index+len("decrby"):]) {
-		// The command is RESP encoded, so a length header precedes every
-		// bulk string. Only the payloads are arguments.
-		if strings.HasPrefix(field, "$") || strings.HasPrefix(field, "*") {
-			continue
-		}
-		args = append(args, field)
-	}
-	require.Len(t, args, 2, "expected key and amount, got %q", query)
-	return args[0] + " " + args[1]
+	require.Contains(t, strings.ToLower(query), "eval", "expected the charge script, got %q", query)
+	lines := strings.Split(strings.TrimSuffix(query, "\r\n"), "\r\n")
+	// The script body carries newlines of its own, so count from the end,
+	// where every payload follows its length header.
+	count := len(lines)
+	require.GreaterOrEqual(t, count, 6, "unexpected charge command %q", query)
+	return strings.Join([]string{lines[count-5], lines[count-3], lines[count-1]}, " ")
 }
 
 func TestParsePriceRejectsUnusableRates(t *testing.T) {
@@ -276,13 +268,13 @@ func TestStreamingChargeUsesTheModelPrice(t *testing.T) {
 					{"x-mse-consumer", "consumer1"},
 					{"x-higress-llm-model", tc.model},
 				})
-				host.CallOnRedisCall(0, test.CreateRedisResp(1000000))
+				admitFunded(host)
 				host.CallOnHttpRequestBody([]byte(`{"stream":true}`))
 
 				host.CallOnHttpStreamingResponseBody(tc.terminal, false)
 				calls, query := redisCalloutCountAndLastQuery(host)
 				require.Equal(t, 1, calls)
-				require.Equal(t, "chat_quota:consumer1 "+tc.want, decrByArguments(t, query))
+				require.Equal(t, "credit_key:consumer1 credit_wallet:u:1 "+tc.want, chargeArguments(t, query))
 			})
 		}
 	})

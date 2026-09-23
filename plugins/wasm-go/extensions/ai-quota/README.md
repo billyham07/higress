@@ -6,7 +6,7 @@ description: AI 配额管理插件配置参考
 
 ## 功能说明
 
-`ai-quota` 插件实现给特定 consumer 根据分配固定的 quota 进行 quota 策略限流，同时支持 quota 管理能力，包括查询 quota 、刷新 quota、增减 quota。
+`ai-quota` 插件按「账户积分钱包」做准入与扣费：每个 consumer（一把 Key）指向一个钱包，请求前检查钱包和 Key 自己的上限，响应后按价格从钱包扣减。钱包与 Key 记录由管理后台（higress-ai-key-admin-v2）写入，插件只读和扣减，不提供管理接口。
 
 `ai-quota` 插件需要配合 认证插件比如 `key-auth`、`jwt-auth` 等插件获取认证身份的 consumer 名称，同时需要配合 `ai-statistics` 插件获取 AI Token 统计信息。
 
@@ -19,10 +19,7 @@ description: AI 配额管理插件配置参考
 
 | 名称                 | 数据类型            | 填写要求                                 | 默认值 | 描述                                         |
 |--------------------|-----------------|--------------------------------------| ---- |--------------------------------------------|
-| `redis_key_prefix` | string          |  选填                                     |   chat_quota:   | qutoa redis key 前缀                         |
-| `admin_consumer`   | string          | 必填                                   |      | 管理 quota 管理身份的 consumer 名称                 |
-| `admin_path`       | string          | 选填                                   |   /quota   | 管理 quota 请求 path 前缀                        |
-| `enable_path_suffixes` | []string     | 选填                                   |  ["/v1/chat/completions", "/v1/messages"] | 启用配额校验的请求路径后缀（仅用于 completion 请求，不影响管理接口路径） |
+| `enable_path_suffixes` | []string     | 选填                                   |  ["/v1/chat/completions", "/v1/messages"] | 启用积分校验与扣费的请求路径后缀 |
 | `redis`            | object          | 是                                    |      | redis相关配置                                  |
 
 `redis`中每一项的配置字段说明
@@ -36,6 +33,32 @@ description: AI 配额管理插件配置参考
 | timeout      | int    | 否   | 1000                                                       | redis连接超时时间，单位毫秒                                                                  |
 | database     | int    | 否   | 0                                                          | 使用的数据库id，例如配置为1，对应`SELECT 1`                                                  |
 
+
+旧版的 `redis_key_prefix`、`admin_consumer`、`admin_path` 已不再读取：它们操作的
+`chat_quota:<consumer>` 计数器没有任何组件再读，保留管理接口只会让人误以为改了额度。
+
+## 积分钱包（Redis 契约）
+
+所有金额单位都是**毫积分**（千分之一积分）。
+
+| Key | 字段 | 含义 |
+|---|---|---|
+| `credit_key:<consumer>` | `owner` | 这把 Key 扣哪个钱包，如 `u:61`（用户）或 `p:<consumer>`（项目 Key） |
+| | `mode` | Key 自己的上限：`none` 不限 / `period` 每个刷新周期 / `once` 一次性 |
+| | `limit` | 上限金额，`mode=none` 时不看 |
+| | `period` / `period_used` | 这把 Key 在哪个周期、用了多少；周期变了自动从 0 算 |
+| | `once_used` | 自一次性上限设置以来用了多少 |
+| `credit_wallet:<owner>` | `period` | 当前刷新周期，由管理后台推进 |
+| | `allowance` | 每个周期发放的积分 |
+| | `period_left` | 本周期还剩多少，可为负（最后一次请求的超额） |
+| | `extra_left` | 额外积分（一次性，不随周期刷新） |
+
+准入：Key 记录或钱包缺失 → 403 `ai-quota.no_account`；`max(period_left,0)+max(extra_left,0) <= 0`
+→ 403 `ai-quota.noquota`；Key 自己的上限用尽 → 403 `ai-quota.key_limit`。Redis 出错一律拒绝。
+
+扣费：先扣本周期额度，再扣额外积分；两者都不够的部分记在 `period_left` 上成为负数，
+由下一次周期刷新抵消，不会吃掉以后发放的额外积分。Key 的计数总是按全额累加——
+Key 的上限只决定它能不能继续花钱包里的积分，Key 本身不持有积分。
 
 ## 积分计费（可选）
 
@@ -72,9 +95,6 @@ Redis 里的计数器一直只有一个数字，请求把它减掉。积分改�
 ### 示例：百炼按模型定价，其余模型走路由默认价
 
 ```yaml
-redis_key_prefix: "chat_quota:"
-admin_consumer: consumer3
-admin_path: /quota
 redis:
   service_name: redis.dns
   service_port: 6379
@@ -106,32 +126,12 @@ default_price:
 
 ## 配置示例
 
-### 识别请求参数 apikey，进行区别限流
 ```yaml
-redis_key_prefix: "chat_quota:"
-admin_consumer: consumer3
-admin_path: /quota
+enable_path_suffixes:
+  - /v1/chat/completions
+  - /v1/messages
 redis:
   service_name: redis-service.default.svc.cluster.local
   service_port: 6379
   timeout: 2000
 ```
-
-
-###  刷新 quota
-
-如果当前请求 url 的后缀符合 admin_path，例如插件在 example.com/v1/chat/completions 这个路由上生效，那么更新 quota 可以通过
-curl https://example.com/v1/chat/completions/quota/refresh -H "Authorization: Bearer credential3" -d "consumer=consumer1&quota=10000" 
-
-Redis 中 key 为 chat_quota:consumer1 的值就会被刷新为 10000
-
-### 查询 quota
-
-查询特定用户的 quota 可以通过 curl https://example.com/v1/chat/completions/quota?consumer=consumer1 -H "Authorization: Bearer credential3"
-将返回： {"quota": 10000, "consumer": "consumer1"}
-
-### 增减 quota 
-
-增减特定用户的 quota 可以通过 curl https://example.com/v1/chat/completions/quota/delta -d "consumer=consumer1&value=100" -H "Authorization: Bearer credential3"
-这样 Redis 中 Key 为 chat_quota:consumer1 的值就会增加100，可以支持负数，则减去对应值。
-

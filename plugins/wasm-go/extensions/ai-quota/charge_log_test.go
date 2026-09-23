@@ -82,7 +82,7 @@ func TestTheChargeIsRecordedInTheAccessLog(t *testing.T) {
 					{"x-mse-consumer", "consumer1"},
 					{"x-higress-llm-model", "glm-5.2"},
 				})
-				host.CallOnRedisCall(0, test.CreateRedisResp(1000000))
+				admitFunded(host)
 				host.CallOnHttpRequestBody([]byte(`{"stream":true}`))
 				host.CallOnHttpStreamingResponseBody(tc.terminal, false)
 
@@ -120,7 +120,7 @@ func TestTheChargeDoesNotReplaceWhatOtherPluginsLogged(t *testing.T) {
 			{"x-mse-consumer", "consumer1"},
 			{"x-higress-llm-model", "glm-5.2"},
 		})
-		host.CallOnRedisCall(0, test.CreateRedisResp(1000000))
+		admitFunded(host)
 		host.CallOnHttpRequestBody([]byte(`{"stream":true}`))
 		host.CallOnHttpStreamingResponseBody(
 			[]byte(`data: {"choices":[],"usage":{"prompt_tokens":10000,"completion_tokens":2000,"total_tokens":12000}}`), false)
