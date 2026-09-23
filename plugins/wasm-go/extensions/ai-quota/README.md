@@ -43,7 +43,7 @@ description: AI 配额管理插件配置参考
 
 | Key | 字段 | 含义 |
 |---|---|---|
-| `credit_key:<consumer>` | `owner` | 这把 Key 扣哪个钱包，如 `u:61`（用户）或 `p:<consumer>`（项目 Key） |
+| `credit_key:<consumer>` | `owner` | 这把 Key 扣哪个钱包：`u:<用户>`、`g:<项目>`，或未归属的 consumer 自己的 `p:<consumer>` |
 | | `mode` | Key 自己的上限：`none` 不限 / `period` 每个刷新周期 / `once` 一次性 |
 | | `limit` | 上限金额，`mode=none` 时不看 |
 | | `period` / `period_used` | 这把 Key 在哪个周期、用了多少；周期变了自动从 0 算 |
@@ -52,12 +52,15 @@ description: AI 配额管理插件配置参考
 | | `allowance` | 每个周期发放的积分 |
 | | `period_left` | 本周期还剩多少，可为负（最后一次请求的超额） |
 | | `extra_left` | 额外积分（一次性，不随周期刷新） |
+| | `unlimited` | `1` 表示不限额（项目默认如此），没有这个字段就是限额 |
 
 准入：Key 记录或钱包缺失 → 403 `ai-quota.no_account`；`max(period_left,0)+max(extra_left,0) <= 0`
-→ 403 `ai-quota.noquota`；Key 自己的上限用尽 → 403 `ai-quota.key_limit`。Redis 出错一律拒绝。
+→ 403 `ai-quota.noquota`（不限额的钱包跳过这一条）；Key 自己的上限用尽 → 403 `ai-quota.key_limit`
+（不限额的钱包也照样检查）。Redis 出错一律拒绝。
 
 扣费：先扣本周期额度，再扣额外积分；两者都不够的部分记在 `period_left` 上成为负数，
-由下一次周期刷新抵消，不会吃掉以后发放的额外积分。Key 的计数总是按全额累加——
+由下一次周期刷新抵消，不会吃掉以后发放的额外积分。不限额的钱包全额记在 `period_left` 上、
+不动额外积分，所以「本周期已用」照样能算，改回限额时额外积分还在。Key 的计数总是按全额累加——
 Key 的上限只决定它能不能继续花钱包里的积分，Key 本身不持有积分。
 
 ## 积分计费（可选）

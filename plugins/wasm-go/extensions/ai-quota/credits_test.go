@@ -32,7 +32,12 @@ func walletHash(period string, periodLeft, extraLeft string) []byte {
 	if period == "" {
 		periodValue = nil
 	}
-	return test.CreateRedisRespArray([]interface{}{periodValue, periodLeft, extraLeft})
+	return test.CreateRedisRespArray([]interface{}{periodValue, periodLeft, extraLeft, nil})
+}
+
+// unlimitedWalletHash is a wallet the console marked unlimited.
+func unlimitedWalletHash(period string, periodLeft, extraLeft string) []byte {
+	return test.CreateRedisRespArray([]interface{}{period, periodLeft, extraLeft, "1"})
 }
 
 // admitFunded answers both admission reads for a key with no cap of its own
@@ -123,6 +128,26 @@ func TestAdmissionDecisions(t *testing.T) {
 				key:    keyHash("u:1", "once", "1000", "p0", "0", "1000"),
 				wallet: walletHash("p1", "9000", "0"),
 				code:   "ai-quota.key_limit",
+			},
+			{
+				// A project left unlimited runs on however far its usage
+				// count has gone below zero.
+				name:   "an unlimited wallet admits with nothing left",
+				key:    keyHash("g:5", "none", "", "p1", "0", "0"),
+				wallet: unlimitedWalletHash("p1", "-5000000", "0"),
+			},
+			{
+				name:   "an unlimited wallet still honours the key's own cap",
+				key:    keyHash("g:5", "period", "1000", "p1", "1000", "1000"),
+				wallet: unlimitedWalletHash("p1", "-5000000", "0"),
+				code:   "ai-quota.key_limit",
+			},
+			{
+				// Only "1" marks a wallet unlimited.
+				name:   "a wallet with no unlimited mark is limited",
+				key:    keyHash("u:1", "none", "", "", nil, nil),
+				wallet: test.CreateRedisRespArray([]interface{}{"p1", "0", "0", "0"}),
+				code:   "ai-quota.noquota",
 			},
 			{
 				// No cap does not mean free: the wallet still decides.

@@ -17,7 +17,7 @@ import (
 // admission and spends them after the response.
 //
 //	credit_key:<consumer>     which wallet a key spends, and the key's own cap
-//	  owner        wallet id, e.g. "u:61" or "p:<consumer>"
+//	  owner        wallet id: "u:<user>", "g:<project>" or "p:<consumer>"
 //	  mode         none | period | once
 //	  limit        the cap in milli-credits; ignored when mode is none
 //	  period       the wallet period period_used was counted in
@@ -29,6 +29,10 @@ import (
 //	  allowance    what one period grants
 //	  period_left  left of this period's allowance; negative is overshoot
 //	  extra_left   one-time credits, never touched by a refresh
+//	  unlimited    "1" admits the wallet's keys whatever it holds; absent
+//	               otherwise. Such a wallet is still charged, into
+//	               period_left alone, so it keeps counting what the period
+//	               cost; its one-time credits are left for when it is limited.
 //
 // A key never holds credits of its own. Its cap only decides whether it may
 // keep spending the wallet, which is why a set of capped keys need not add up
@@ -54,6 +58,9 @@ const (
 // one, so its period counter restarts from zero here; the console never has
 // to walk every key when a period turns over.
 //
+// An unlimited wallet pays everything from the period bucket: its whole cost
+// reads as this period's usage, and the refresh starts the count again.
+//
 // KEYS[1] credit_key:<consumer>, KEYS[2] credit_wallet:<owner>
 // ARGV[1] amount in milli-credits, a non-negative integer
 //
@@ -63,16 +70,23 @@ local amount = tonumber(ARGV[1])
 if not amount or amount < 0 or amount ~= math.floor(amount) then
   return {'invalid'}
 end
-local wallet = redis.call('HMGET', KEYS[2], 'period', 'period_left', 'extra_left')
+local wallet = redis.call('HMGET', KEYS[2], 'period', 'period_left', 'extra_left', 'unlimited')
 if not wallet[1] then
   return {'missing'}
 end
 local period_left = tonumber(wallet[2]) or 0
 local extra_left = tonumber(wallet[3]) or 0
-local from_period = math.min(math.max(period_left, 0), amount)
-local rest = amount - from_period
-local from_extra = math.min(math.max(extra_left, 0), rest)
-local overshoot = rest - from_extra
+local from_period, from_extra, overshoot
+if wallet[4] == '1' then
+  from_period = math.min(math.max(period_left, 0), amount)
+  from_extra = 0
+  overshoot = amount - from_period
+else
+  from_period = math.min(math.max(period_left, 0), amount)
+  local rest = amount - from_period
+  from_extra = math.min(math.max(extra_left, 0), rest)
+  overshoot = rest - from_extra
+end
 if from_period + overshoot > 0 then
   redis.call('HINCRBY', KEYS[2], 'period_left', -(from_period + overshoot))
 end
@@ -104,6 +118,7 @@ type creditWallet struct {
 	period     string
 	periodLeft int64
 	extraLeft  int64
+	unlimited  bool
 }
 
 // available is what the wallet can still pay for. Overshoot on the period
@@ -129,7 +144,7 @@ func (key creditKey) allows(wallet creditWallet) bool {
 }
 
 var creditKeyFields = []string{"owner", "mode", "limit", "period", "period_used", "once_used"}
-var creditWalletFields = []string{"period", "period_left", "extra_left"}
+var creditWalletFields = []string{"period", "period_left", "extra_left", "unlimited"}
 
 func parseCreditKey(response resp.Value) (creditKey, bool) {
 	values := response.Array()
@@ -159,6 +174,7 @@ func parseCreditWallet(response resp.Value) (creditWallet, bool) {
 		period:     values[0].String(),
 		periodLeft: respInt(values[1]),
 		extraLeft:  respInt(values[2]),
+		unlimited:  !values[3].IsNull() && values[3].String() == "1",
 	}, true
 }
 
@@ -198,7 +214,7 @@ func admitCredits(ctx wrapper.HttpContext, config QuotaConfig, consumer string) 
 			}
 			log.Debugf("consumer:%s wallet:%s period_left:%d extra_left:%d key_mode:%s",
 				consumer, key.owner, wallet.periodLeft, wallet.extraLeft, key.mode)
-			if wallet.available() <= 0 {
+			if !wallet.unlimited && wallet.available() <= 0 {
 				util.SendResponse(http.StatusForbidden, "ai-quota.noquota", "text/plain", "Request denied by ai quota check, No quota left")
 				return
 			}
