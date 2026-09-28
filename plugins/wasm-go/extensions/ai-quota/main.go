@@ -42,6 +42,10 @@ const (
 	// reader -- dashboard, log column, whoever greps it next -- silently
 	// wrong by a factor of a thousand.
 	creditsLogKey = "credit_millis"
+	// creditsBaseLogKey is what the price alone came to, before the route's
+	// multiplier; creditsMultiplierLogKey is that multiplier in percent.
+	creditsBaseLogKey       = "credit_base_millis"
+	creditsMultiplierLogKey = "credit_multiplier_percent"
 	// quotaCharactersContextKey holds the character count read from the
 	// request body, for routes priced per character. It is recorded on the
 	// way in because the response -- audio -- cannot carry it.
@@ -89,6 +93,9 @@ type QuotaConfig struct {
 	// credits, expressed in the milli-credit ledger.
 	DefaultPrice *Price           `yaml:"default_price"`
 	ModelPrices  map[string]Price `yaml:"model_prices"`
+	// MultiplierPercent scales every charge on this route, after the price:
+	// 100 is the price as configured, 0 makes the route free. See multiplier.go.
+	MultiplierPercent int64 `yaml:"multiplier_percent"`
 	// counters caches the credit counters this rule has defined, keyed by the
 	// full metric name. Defining a counter twice is wasteful rather than
 	// wrong, but the cache is also what keeps the per-request path free of
@@ -190,6 +197,9 @@ func parseConfig(json gjson.Result, config *QuotaConfig) error {
 	})
 
 	if err := parsePrices(json, config); err != nil {
+		return err
+	}
+	if err := parseMultiplier(json, config); err != nil {
 		return err
 	}
 
@@ -340,19 +350,25 @@ func chargeQuotaOnce(ctx wrapper.HttpContext, config QuotaConfig) {
 	}
 
 	model := ctx.GetStringContext(quotaModelContextKey, "")
-	amount, ok := chargeAmount(ctx, config, model)
+	base, ok := chargeAmount(ctx, config, model)
 	if !ok {
 		return
 	}
+	amount := config.scale(base)
 
 	consumer := ctx.GetContext("consumer").(string)
-	log.Debugf("update consumer:%s, model:%s, charge:%d", consumer, model, amount)
-	if err := spendCredits(ctx, config, consumer, amount); err != nil {
-		log.Errorf("failed to charge consumer %s: %v", consumer, err)
-		return
+	log.Debugf("update consumer:%s, model:%s, base:%d, multiplier:%d%%, charge:%d",
+		consumer, model, base, config.MultiplierPercent, amount)
+	// A free route is not a Redis round trip: every request on self-hosted
+	// capacity would otherwise pay a script call to add zero.
+	if !config.free() {
+		if err := spendCredits(ctx, config, consumer, amount); err != nil {
+			log.Errorf("failed to charge consumer %s: %v", consumer, err)
+			return
+		}
 	}
 	ctx.SetContext(quotaChargedContextKey, true)
-	reportCharge(ctx, amount)
+	reportCharge(ctx, amount, base, config.MultiplierPercent)
 	reportCreditsMetric(ctx, config, consumer, amount)
 }
 
@@ -380,7 +396,11 @@ func chargeQuotaOnce(ctx wrapper.HttpContext, config QuotaConfig) {
 // statistics row showing 0 says something a missing field does not: an
 // absent field means the request was never charged at all -- no usage
 // arrived under a token price -- and those two must not look alike.
-func reportCharge(ctx wrapper.HttpContext, amount int64) {
+//
+// Next to the charge sit the two numbers it was made from: the price's own
+// amount and the route's multiplier. A 0 on a free route and a 0 from a free
+// price are otherwise the same number, and only one of them is a discount.
+func reportCharge(ctx wrapper.HttpContext, amount, base, multiplierPercent int64) {
 	// Contribute exactly one field, by replacing this plugin's attribute map
 	// rather than adding to it. The wrapper merges the WHOLE map into the
 	// shared object, and tokenusage has already filled it with its own view
@@ -389,7 +409,11 @@ func reportCharge(ctx wrapper.HttpContext, amount int64) {
 	// ai-statistics logged from a filter that did see the request body, so a
 	// plugin that only wants to add a cost would silently corrupt the model
 	// and token fields of every log line.
-	ctx.SetUserAttributeMap(map[string]interface{}{creditsLogKey: amount})
+	ctx.SetUserAttributeMap(map[string]interface{}{
+		creditsLogKey:           amount,
+		creditsBaseLogKey:       base,
+		creditsMultiplierLogKey: multiplierPercent,
+	})
 	if err := ctx.WriteUserAttributeToLogWithKey(wrapper.AILogKey); err != nil {
 		// The quota has already moved. Losing the log line is bad, but it is
 		// not a reason to fail a request whose money is already spent.

@@ -214,6 +214,15 @@ func admitCredits(ctx wrapper.HttpContext, config QuotaConfig, consumer string) 
 			}
 			log.Debugf("consumer:%s wallet:%s period_left:%d extra_left:%d key_mode:%s",
 				consumer, key.owner, wallet.periodLeft, wallet.extraLeft, key.mode)
+			// A free route costs the wallet nothing, so neither what the
+			// wallet holds nor the key's own cap has anything to protect.
+			// Both records still had to exist: free is a price, not an
+			// identity.
+			if config.free() {
+				ctx.SetContext(creditOwnerContextKey, key.owner)
+				proxywasm.ResumeHttpRequest()
+				return
+			}
 			if !wallet.unlimited && wallet.available() <= 0 {
 				util.SendResponse(http.StatusForbidden, "ai-quota.noquota", "text/plain", "Request denied by ai quota check, No quota left")
 				return
