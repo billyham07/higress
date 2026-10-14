@@ -8,9 +8,6 @@ spec:
   defaultConfigDisable: true
   matchRules:
   - config:
-      redis_key_prefix: "chat_quota:"
-      admin_consumer: consumer3
-      admin_path: /quota
       redis:
         service_name: redis-service.default.svc.cluster.local
         service_port: 6379

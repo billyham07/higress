@@ -27,9 +27,6 @@ import (
 // 测试配置：基础配置
 var basicConfig = func() json.RawMessage {
 	data, _ := json.Marshal(map[string]interface{}{
-		"admin_consumer":   "admin",
-		"redis_key_prefix": "chat_quota:",
-		"admin_path":       "/quota",
 		"enable_path_suffixes": []string{
 			"/v1/chat/completions",
 			"/v1/messages",
@@ -45,9 +42,13 @@ var basicConfig = func() json.RawMessage {
 	return data
 }()
 
-// 测试配置：缺少admin_consumer
-var missingAdminConsumerConfig = func() json.RawMessage {
+// The production rules still carry the retired per-key counter's settings.
+// They must keep loading after the plugin stops reading them.
+var retiredSettingsConfig = func() json.RawMessage {
 	data, _ := json.Marshal(map[string]interface{}{
+		"admin_consumer":   "admin",
+		"redis_key_prefix": "chat_quota:",
+		"admin_path":       "/quota",
 		"redis": map[string]interface{}{
 			"service_name": "redis.static",
 			"service_port": 6379,
@@ -56,182 +57,78 @@ var missingAdminConsumerConfig = func() json.RawMessage {
 	return data
 }()
 
-var defaultPathSuffixesConfig = func() json.RawMessage {
+var missingRedisConfig = func() json.RawMessage {
 	data, _ := json.Marshal(map[string]interface{}{
-		"admin_consumer": "admin",
-		"redis": map[string]interface{}{
-			"service_name": "redis.static",
-			"service_port": 6379,
-		},
+		"enable_path_suffixes": []string{"/v1/chat/completions"},
 	})
 	return data
 }()
 
 func TestParseConfig(t *testing.T) {
 	test.RunGoTest(t, func(t *testing.T) {
-		// 测试基础配置解析
 		t.Run("basic config", func(t *testing.T) {
 			host, status := test.NewTestHost(basicConfig)
 			defer host.Reset()
 			require.Equal(t, types.OnPluginStartStatusOK, status)
 			config, err := host.GetMatchConfig()
 			require.NoError(t, err)
-			require.NotNil(t, config)
-
 			quotaConfig := config.(*QuotaConfig)
-			require.Equal(t, "admin", quotaConfig.AdminConsumer)
-			require.Equal(t, "chat_quota:", quotaConfig.RedisKeyPrefix)
-			require.Equal(t, "/quota", quotaConfig.AdminPath)
 			require.Equal(t, []string{"/v1/chat/completions", "/v1/messages", "/v1/responses"}, quotaConfig.EnablePathSuffixes)
 		})
 
-		// 测试缺少admin_consumer的配置
-		t.Run("missing admin_consumer", func(t *testing.T) {
-			host, status := test.NewTestHost(missingAdminConsumerConfig)
-			defer host.Reset()
-			require.Equal(t, types.OnPluginStartStatusFailed, status)
-		})
-
-		t.Run("default path suffixes", func(t *testing.T) {
-			host, status := test.NewTestHost(defaultPathSuffixesConfig)
+		t.Run("retired settings still load, with the default suffixes", func(t *testing.T) {
+			host, status := test.NewTestHost(retiredSettingsConfig)
 			defer host.Reset()
 			require.Equal(t, types.OnPluginStartStatusOK, status)
 			config, err := host.GetMatchConfig()
 			require.NoError(t, err)
-			require.NotNil(t, config)
-
 			quotaConfig := config.(*QuotaConfig)
 			require.Equal(t, []string{"/v1/chat/completions", "/v1/messages"}, quotaConfig.EnablePathSuffixes)
+		})
+
+		t.Run("missing redis", func(t *testing.T) {
+			host, status := test.NewTestHost(missingRedisConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusFailed, status)
 		})
 	})
 }
 
 func TestOnHttpRequestHeaders(t *testing.T) {
 	test.RunTest(t, func(t *testing.T) {
-		// 测试聊天完成模式的请求头处理
-		t.Run("chat completion mode", func(t *testing.T) {
-			host, status := test.NewTestHost(basicConfig)
-			defer host.Reset()
-			require.Equal(t, types.OnPluginStartStatusOK, status)
-
-			// 设置请求头，包含consumer信息
-			action := host.CallOnHttpRequestHeaders([][2]string{
-				{":authority", "example.com"},
-				{":path", "/v1/chat/completions"},
-				{":method", "POST"},
-				{"x-mse-consumer", "consumer1"},
-			})
-
-			// 由于需要调用Redis检查配额，应该返回HeaderStopAllIterationAndWatermark
-			require.Equal(t, types.HeaderStopAllIterationAndWatermark, action)
-
-			// 模拟Redis调用响应（有足够配额）
-			resp := test.CreateRedisResp(1000)
-			host.CallOnRedisCall(0, resp)
-			action = host.GetHttpStreamAction()
-			require.Equal(t, types.ActionContinue, action)
-			host.CompleteHttp()
-		})
-
-		// 测试管理员查询模式的请求头处理
-		t.Run("admin query mode", func(t *testing.T) {
-			host, status := test.NewTestHost(basicConfig)
-			defer host.Reset()
-			require.Equal(t, types.OnPluginStartStatusOK, status)
-
-			// 设置请求头，包含admin consumer信息
-			action := host.CallOnHttpRequestHeaders([][2]string{
-				{":authority", "example.com"},
-				{":path", "/v1/chat/completions/quota?consumer=consumer1"},
-				{":method", "GET"},
-				{"x-mse-consumer", "admin"},
-			})
-
-			// 管理员查询模式应该返回 ActionPause
-			require.Equal(t, types.ActionPause, action)
-
-			// 模拟Redis调用响应
-			resp := test.CreateRedisResp(500)
-			host.CallOnRedisCall(0, resp)
-
-			response := host.GetLocalResponse()
-			require.Equal(t, uint32(http.StatusOK), response.StatusCode)
-			require.Equal(t, "{\"consumer\":\"consumer1\",\"quota\":500}", string(response.Data))
-			host.CompleteHttp()
-		})
-
-		// 测试无consumer的情况
 		t.Run("no consumer", func(t *testing.T) {
 			host, status := test.NewTestHost(basicConfig)
 			defer host.Reset()
 			require.Equal(t, types.OnPluginStartStatusOK, status)
 
-			// 设置请求头，不包含consumer信息
 			action := host.CallOnHttpRequestHeaders([][2]string{
 				{":authority", "example.com"},
 				{":path", "/v1/chat/completions"},
 				{":method", "POST"},
 			})
-
-			// 无consumer应该返回ActionContinue
 			require.Equal(t, types.ActionContinue, action)
+			response := host.GetLocalResponse()
+			require.NotNil(t, response)
+			require.Equal(t, uint32(http.StatusUnauthorized), response.StatusCode)
 		})
-	})
-}
 
-func TestOnHttpRequestBody(t *testing.T) {
-	test.RunTest(t, func(t *testing.T) {
-		// 测试管理员刷新模式的请求体处理
-		t.Run("admin refresh mode", func(t *testing.T) {
+		// The old admin endpoints are gone: such a path is just a path no
+		// suffix matches, and the gate stays out of it.
+		t.Run("retired admin path is not special", func(t *testing.T) {
 			host, status := test.NewTestHost(basicConfig)
 			defer host.Reset()
 			require.Equal(t, types.OnPluginStartStatusOK, status)
 
-			// 先设置请求头
-			host.CallOnHttpRequestHeaders([][2]string{
+			action := host.CallOnHttpRequestHeaders([][2]string{
 				{":authority", "example.com"},
 				{":path", "/v1/chat/completions/quota/refresh"},
 				{":method", "POST"},
 				{"x-mse-consumer", "admin"},
 			})
-
-			// 设置请求体
-			body := "consumer=consumer1&quota=1000"
-			action := host.CallOnHttpRequestBody([]byte(body))
-
-			// 管理员刷新模式应该返回ActionPause
-			require.Equal(t, types.ActionPause, action)
-
-			// 模拟Redis调用响应
-			resp := test.CreateRedisRespArray([]interface{}{"OK"})
-			host.CallOnRedisCall(0, resp)
-
-			response := host.GetLocalResponse()
-			require.Equal(t, uint32(http.StatusOK), response.StatusCode)
-			require.Equal(t, "refresh quota successful", string(response.Data))
-			host.CompleteHttp()
-		})
-
-		// 测试聊天完成模式的请求体处理
-		t.Run("chat completion mode", func(t *testing.T) {
-			host, status := test.NewTestHost(basicConfig)
-			defer host.Reset()
-			require.Equal(t, types.OnPluginStartStatusOK, status)
-
-			// 先设置请求头
-			host.CallOnHttpRequestHeaders([][2]string{
-				{":authority", "example.com"},
-				{":path", "/v1/chat/completions"},
-				{":method", "POST"},
-				{"x-mse-consumer", "consumer1"},
-			})
-
-			// 设置请求体
-			body := `{"model": "gpt-3.5-turbo", "messages": [{"role": "user", "content": "Hello"}]}`
-			action := host.CallOnHttpRequestBody([]byte(body))
-
-			// 聊天完成模式应该返回ActionContinue
 			require.Equal(t, types.ActionContinue, action)
+			require.Nil(t, host.GetLocalResponse())
+			calls, _ := redisCalloutCountAndLastQuery(host)
+			require.Equal(t, 0, calls)
 		})
 	})
 }
@@ -251,9 +148,10 @@ func TestOnHttpStreamingResponseBody(t *testing.T) {
 				{":method", "POST"},
 				{"x-mse-consumer", "consumer1"},
 			})
+			admitFunded(host)
 
 			// 测试流式响应体处理
-			data := []byte(`{"choices": [{"delta": {"content": "Hello"}}]}`)
+			data := []byte(`{"choices": [{"delta": {"content": "Hello"}}], "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}}`)
 			action := host.CallOnHttpStreamingResponseBody(data, false)
 
 			require.Equal(t, types.ActionContinue, action)
@@ -269,9 +167,10 @@ func TestOnHttpStreamingResponseBody(t *testing.T) {
 			// 结束流应该返回原始数据
 			require.Equal(t, data, result)
 
-			// 模拟Redis调用响应（减少配额）
-			resp := test.CreateRedisRespArray([]interface{}{30})
-			host.CallOnRedisCall(0, resp)
+			calls, query := redisCalloutCountAndLastQuery(host)
+			require.Equal(t, 1, calls)
+			require.Contains(t, query, "quota_wallet:u:1")
+			host.CallOnRedisCall(0, test.CreateRedisRespArray([]interface{}{"ok", 30}))
 
 			host.CompleteHttp()
 		})
@@ -358,7 +257,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"outpu
 					{":method", "POST"},
 					{"x-mse-consumer", "consumer1"},
 				})
-				host.CallOnRedisCall(0, test.CreateRedisResp(1000))
+				admitFunded(host)
 				host.CallOnHttpRequestBody(tc.requestBody)
 
 				for _, chunk := range tc.chunks {
@@ -442,92 +341,20 @@ func TestGetQuotaToken(t *testing.T) {
 
 func TestGetOperationMode(t *testing.T) {
 	tests := []struct {
-		name      string
-		path      string
-		adminPath string
-		suffixes  []string
-		chatMode  ChatMode
-		adminMode AdminMode
+		name     string
+		path     string
+		suffixes []string
+		chatMode ChatMode
 	}{
-		{
-			name:      "chat completion mode",
-			path:      "/v1/chat/completions",
-			adminPath: "/quota",
-			suffixes:  []string{"/v1/chat/completions", "/v1/messages"},
-			chatMode:  ChatModeCompletion,
-			adminMode: AdminModeNone,
-		},
-		{
-			name:      "admin query mode",
-			path:      "/v1/chat/completions/quota",
-			adminPath: "/quota",
-			suffixes:  []string{"/v1/chat/completions", "/v1/messages"},
-			chatMode:  ChatModeAdmin,
-			adminMode: AdminModeQuery,
-		},
-		{
-			name:      "admin refresh mode",
-			path:      "/v1/chat/completions/quota/refresh",
-			adminPath: "/quota",
-			suffixes:  []string{"/v1/chat/completions", "/v1/messages"},
-			chatMode:  ChatModeAdmin,
-			adminMode: AdminModeRefresh,
-		},
-		{
-			name:      "admin delta mode",
-			path:      "/v1/chat/completions/quota/delta",
-			adminPath: "/quota",
-			suffixes:  []string{"/v1/chat/completions", "/v1/messages"},
-			chatMode:  ChatModeAdmin,
-			adminMode: AdminModeDelta,
-		},
-		{
-			name:      "anthropic messages completion mode",
-			path:      "/v1/messages",
-			adminPath: "/quota",
-			suffixes:  []string{"/v1/chat/completions", "/v1/messages"},
-			chatMode:  ChatModeCompletion,
-			adminMode: AdminModeNone,
-		},
-		{
-			name:      "custom suffix completion mode",
-			path:      "/llm/invoke",
-			adminPath: "/quota",
-			suffixes:  []string{"/invoke"},
-			chatMode:  ChatModeCompletion,
-			adminMode: AdminModeNone,
-		},
-		{
-			name:      "admin path fixed to chat completions",
-			path:      "/v1/chat/completions/quota",
-			adminPath: "/quota",
-			suffixes:  []string{"/invoke"},
-			chatMode:  ChatModeAdmin,
-			adminMode: AdminModeQuery,
-		},
-		{
-			name:      "messages admin path not supported",
-			path:      "/v1/messages/quota",
-			adminPath: "/quota",
-			suffixes:  []string{"/v1/chat/completions", "/v1/messages"},
-			chatMode:  ChatModeNone,
-			adminMode: AdminModeNone,
-		},
-		{
-			name:      "none mode",
-			path:      "/other/path",
-			adminPath: "/quota",
-			suffixes:  []string{"/v1/chat/completions", "/v1/messages"},
-			chatMode:  ChatModeNone,
-			adminMode: AdminModeNone,
-		},
+		{"chat completion", "/v1/chat/completions", []string{"/v1/chat/completions", "/v1/messages"}, ChatModeCompletion},
+		{"anthropic messages", "/v1/messages", []string{"/v1/chat/completions", "/v1/messages"}, ChatModeCompletion},
+		{"custom suffix", "/llm/invoke", []string{"/invoke"}, ChatModeCompletion},
+		{"retired admin path", "/v1/chat/completions/quota", []string{"/v1/chat/completions"}, ChatModeNone},
+		{"other path", "/other/path", []string{"/v1/chat/completions", "/v1/messages"}, ChatModeNone},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			chatMode, adminMode := getOperationMode(tt.path, tt.adminPath, tt.suffixes)
-			require.Equal(t, tt.chatMode, chatMode)
-			require.Equal(t, tt.adminMode, adminMode)
+			require.Equal(t, tt.chatMode, getOperationMode(tt.path, tt.suffixes))
 		})
 	}
 }
