@@ -21,6 +21,12 @@ const (
 	pluginName             = "ai-quota"
 	quotaChargedContextKey = "ai-quota-charged"
 	quotaTerminalTailKey   = "ai-quota-terminal-tail"
+
+	streamingContentType = "text/event-stream"
+	// The gateway's downstream connection buffer limit (32KiB) also caps a
+	// buffered response, so a larger non-streaming body would fail the request
+	// unless the encoder limit is raised. Same ceiling as ai-proxy.
+	responseBodyBufferLimit uint32 = 100 * 1024 * 1024
 )
 
 type ChatMode string
@@ -37,7 +43,9 @@ func init() {
 		pluginName,
 		wrapper.ParseConfig(parseConfig),
 		wrapper.ProcessRequestHeaders(onHttpRequestHeaders),
+		wrapper.ProcessResponseHeaders(onHttpResponseHeaders),
 		wrapper.ProcessStreamingResponseBody(onHttpStreamingResponseBody),
+		wrapper.ProcessResponseBody(onHttpResponseBody),
 	)
 }
 
@@ -151,23 +159,32 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig) types
 	return types.HeaderStopAllIterationAndWatermark
 }
 
+// onHttpResponseHeaders buffers a non-streaming response. Envoy may hand a JSON
+// body over in several chunks, and the usage object at its end cannot be parsed
+// out of a fragment that does not start at the top-level object, so the request
+// would go uncharged. Only an SSE response is parsed chunk by chunk.
+func onHttpResponseHeaders(ctx wrapper.HttpContext, _ QuotaConfig) types.Action {
+	if chatMode, ok := ctx.GetContext("chatMode").(ChatMode); !ok || chatMode == ChatModeNone {
+		ctx.DontReadResponseBody()
+		return types.ActionContinue
+	}
+	contentType, _ := proxywasm.GetHttpResponseHeader("content-type")
+	if !strings.Contains(strings.ToLower(contentType), streamingContentType) {
+		ctx.BufferResponseBody()
+		ctx.SetResponseBodyBufferLimit(responseBodyBufferLimit)
+	}
+	return types.ActionContinue
+}
+
+func onHttpResponseBody(ctx wrapper.HttpContext, config QuotaConfig, body []byte) types.Action {
+	recordResponseUsage(ctx, body)
+	chargeQuotaOnce(ctx, config)
+	return types.ActionContinue
+}
+
 func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config QuotaConfig, data []byte, endOfStream bool) []byte {
-	chatMode, ok := ctx.GetContext("chatMode").(ChatMode)
-	if !ok {
+	if !recordResponseUsage(ctx, data) {
 		return data
-	}
-	if chatMode == ChatModeNone {
-		return data
-	}
-	usage := tokenusage.GetTokenUsage(ctx, data)
-	enrichAnthropicStreamingUsage(ctx, data, &usage)
-	if usage.TotalToken > 0 {
-		ctx.SetContext(tokenusage.CtxKeyInputToken, usage.InputToken)
-		ctx.SetContext(tokenusage.CtxKeyOutputToken, usage.OutputToken)
-		ctx.SetContext(tokenusage.CtxKeyTotalToken, usage.TotalToken)
-		if len(usage.InputTokenDetails) > 0 {
-			ctx.SetContext(tokenusage.CtxKeyInputTokenDetails, usage.InputTokenDetails)
-		}
 	}
 
 	// SSE clients often stop reading after a protocol-level terminal frame without
@@ -180,11 +197,31 @@ func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config QuotaConfig, da
 	return data
 }
 
+// recordResponseUsage keeps the usage found in data, and reports whether the
+// request is one the quota governs.
+func recordResponseUsage(ctx wrapper.HttpContext, data []byte) bool {
+	if chatMode, ok := ctx.GetContext("chatMode").(ChatMode); !ok || chatMode == ChatModeNone {
+		return false
+	}
+	usage := tokenusage.GetTokenUsage(ctx, data)
+	enrichAnthropicStreamingUsage(ctx, data, &usage)
+	if usage.TotalToken > 0 {
+		ctx.SetContext(tokenusage.CtxKeyInputToken, usage.InputToken)
+		ctx.SetContext(tokenusage.CtxKeyOutputToken, usage.OutputToken)
+		ctx.SetContext(tokenusage.CtxKeyTotalToken, usage.TotalToken)
+		if len(usage.InputTokenDetails) > 0 {
+			ctx.SetContext(tokenusage.CtxKeyInputTokenDetails, usage.InputTokenDetails)
+		}
+	}
+	return true
+}
+
 func chargeQuotaOnce(ctx wrapper.HttpContext, config QuotaConfig) {
 	if ctx.GetBoolContext(quotaChargedContextKey, false) {
 		return
 	}
-	if ctx.GetContext("consumer") == nil {
+	consumer, ok := ctx.GetContext("consumer").(string)
+	if !ok || consumer == "" {
 		return
 	}
 
@@ -198,7 +235,6 @@ func chargeQuotaOnce(ctx wrapper.HttpContext, config QuotaConfig) {
 		return
 	}
 
-	consumer := ctx.GetContext("consumer").(string)
 	log.Debugf("charge consumer:%s, totalToken:%d", consumer, totalToken)
 	if err := spendQuota(ctx, config, consumer, totalToken); err != nil {
 		log.Errorf("failed to charge consumer %s quota: %v", consumer, err)

@@ -16,11 +16,16 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
 	"github.com/higress-group/wasm-go/pkg/test"
+	"github.com/higress-group/wasm-go/pkg/tokenusage"
+	"github.com/higress-group/wasm-go/pkg/wrapper"
 	"github.com/stretchr/testify/require"
 )
 
@@ -279,6 +284,168 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"outpu
 			})
 		}
 	})
+}
+
+// A non-streaming body arrives in as many chunks as Envoy likes, and the usage
+// object at its end cannot be parsed out of a fragment. The body is buffered and
+// charged whole, exactly once.
+func TestNonStreamingResponseIsChargedWhole(t *testing.T) {
+	test.RunTest(t, func(t *testing.T) {
+		tests := []struct {
+			name        string
+			path        string
+			contentType string
+			body        string
+			wantTotal   int
+		}{
+			{
+				name:        "openai chat completion",
+				path:        "/v1/chat/completions",
+				contentType: "application/json; charset=utf-8",
+				body:        `{"id":"chatcmpl-1","object":"chat.completion","model":"qwen3.8-flash","choices":[{"index":0,"message":{"role":"assistant","content":"a long answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":50,"total_tokens":3385,"completion_tokens":3335}}`,
+				wantTotal:   3385,
+			},
+			{
+				name:        "anthropic message includes cache tokens",
+				path:        "/v1/messages",
+				contentType: "application/json",
+				body:        `{"id":"msg_1","type":"message","model":"qwen3.8-max-preview","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":20,"output_tokens":10,"cache_read_input_tokens":80,"cache_creation_input_tokens":15}}`,
+				wantTotal:   125,
+			},
+			{
+				name:      "no content type is not taken for a stream",
+				path:      "/v1/chat/completions",
+				body:      `{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`,
+				wantTotal: 7,
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				host, status := test.NewTestHost(basicConfig)
+				defer host.Reset()
+				require.Equal(t, types.OnPluginStartStatusOK, status)
+
+				host.CallOnHttpRequestHeaders([][2]string{
+					{":authority", "example.com"},
+					{":path", tc.path},
+					{":method", "POST"},
+					{"x-mse-consumer", "consumer1"},
+				})
+				admitFunded(host)
+				headers := [][2]string{{":status", "200"}}
+				if tc.contentType != "" {
+					headers = append(headers, [2]string{"content-type", tc.contentType})
+				}
+				require.Equal(t, types.ActionContinue, host.CallOnHttpResponseHeaders(headers))
+
+				// Three chunks, the last cut through the middle of the usage object.
+				body := []byte(tc.body)
+				usageAt := strings.Index(tc.body, `"usage"`)
+				cuts := []int{usageAt / 2, usageAt + 12, len(body)}
+				previous := 0
+				for i, cut := range cuts {
+					endOfStream := i == len(cuts)-1
+					action := host.CallOnHttpStreamingResponseBody(body[previous:cut], endOfStream)
+					previous = cut
+					if !endOfStream {
+						require.Equal(t, types.ActionPause, action, "a partial body is held back")
+						calls, _ := redisCalloutCountAndLastQuery(host)
+						require.Equal(t, 0, calls, "nothing is charged before the body is whole")
+						continue
+					}
+					require.Equal(t, types.ActionContinue, action)
+				}
+				require.Equal(t, body, host.GetResponseBody(), "the client gets the body unchanged")
+
+				calls, query := redisCalloutCountAndLastQuery(host)
+				require.Equal(t, 1, calls)
+				total := strconv.Itoa(tc.wantTotal)
+				require.Contains(t, query, fmt.Sprintf("$%d\r\n%s\r\n", len(total), total))
+				host.CallOnRedisCall(0, test.CreateRedisRespArray([]interface{}{"ok", 30}))
+				host.CompleteHttp()
+			})
+		}
+	})
+}
+
+// An SSE response is still passed through chunk by chunk and charged on its
+// semantic end, not held back until the stream closes.
+func TestEventStreamResponseIsNotBuffered(t *testing.T) {
+	test.RunTest(t, func(t *testing.T) {
+		host, status := test.NewTestHost(basicConfig)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+
+		completionRequest(host)
+		admitFunded(host)
+		host.CallOnHttpResponseHeaders([][2]string{
+			{":status", "200"},
+			{"content-type", "text/event-stream; charset=utf-8"},
+		})
+
+		first := []byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		require.Equal(t, types.ActionContinue, host.CallOnHttpStreamingResponseBody(first, false))
+		require.Equal(t, first, host.GetResponseBody())
+
+		host.CallOnHttpStreamingResponseBody([]byte("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\n"), false)
+		calls, query := redisCalloutCountAndLastQuery(host)
+		require.Equal(t, 1, calls)
+		require.Contains(t, query, "$1\r\n7\r\n")
+
+		host.CallOnHttpStreamingResponseBody([]byte("data: [DONE]\n\n"), true)
+		calls, _ = redisCalloutCountAndLastQuery(host)
+		require.Equal(t, 1, calls)
+	})
+}
+
+// Responses on a path the quota does not govern are never read.
+func TestUngovernedResponseIsNotRead(t *testing.T) {
+	test.RunTest(t, func(t *testing.T) {
+		host, status := test.NewTestHost(basicConfig)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+
+		host.CallOnHttpRequestHeaders([][2]string{
+			{":authority", "example.com"},
+			{":path", "/v1/models"},
+			{":method", "GET"},
+			{"x-mse-consumer", "consumer1"},
+		})
+		host.CallOnHttpResponseHeaders([][2]string{{":status", "200"}, {"content-type", "application/json"}})
+		data := []byte(`{"data":[],"usage":{"total_tokens":7}}`)
+		require.Equal(t, types.ActionContinue, host.CallOnHttpStreamingResponseBody(data, false))
+		host.CallOnHttpStreamingResponseBody(nil, true)
+		calls, _ := redisCalloutCountAndLastQuery(host)
+		require.Equal(t, 0, calls)
+	})
+}
+
+type contextOnlyHTTPContext struct {
+	wrapper.HttpContext
+	values map[string]interface{}
+}
+
+func (c *contextOnlyHTTPContext) GetContext(key string) interface{} { return c.values[key] }
+
+func (c *contextOnlyHTTPContext) GetBoolContext(key string, defaultValue bool) bool {
+	if value, ok := c.values[key].(bool); ok {
+		return value
+	}
+	return defaultValue
+}
+
+// A consumer that is missing or not a string is skipped, not a panic.
+func TestChargeSkipsAnUnusableConsumer(t *testing.T) {
+	for _, consumer := range []interface{}{nil, 42, ""} {
+		ctx := &contextOnlyHTTPContext{values: map[string]interface{}{
+			"consumer":                   consumer,
+			tokenusage.CtxKeyTotalToken:  int64(7),
+			tokenusage.CtxKeyInputToken:  int64(3),
+			tokenusage.CtxKeyOutputToken: int64(4),
+		}}
+		require.NotPanics(t, func() { chargeQuotaOnce(ctx, QuotaConfig{}) }, "consumer %v", consumer)
+	}
 }
 
 func redisCalloutCountAndLastQuery(host test.TestHost) (int, string) {
