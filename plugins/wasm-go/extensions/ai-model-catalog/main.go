@@ -48,9 +48,11 @@ func init() {
 }
 
 type Model struct {
-	ID      string
-	OwnedBy string
-	Created int64
+	ID          string
+	OwnedBy     string
+	Created     int64
+	Aliases     []string
+	ListAliases bool
 }
 
 type Config struct {
@@ -58,9 +60,12 @@ type Config struct {
 	basePath       string
 	// models keeps declaration order, which is also the response order: the
 	// control plane decides how models are sorted, the gateway does not re-sort.
-	models     []Model
-	modelIndex map[string]int
-	consumers  map[string]map[string]struct{}
+	models        []Model
+	modelIndex    map[string]int
+	aliasIndex    map[string]int
+	consumers     map[string]map[string]struct{}
+	unified       bool
+	denyAllGrants bool
 }
 
 func parseConfig(cfg gjson.Result, config *Config) error {
@@ -82,9 +87,23 @@ func parseConfig(cfg gjson.Result, config *Config) error {
 		created = time.Now().Unix()
 	}
 
+	config.unified = isUnifiedCatalogConfig(cfg)
+	if catalogVersionInvalid(cfg) {
+		config.unified = true
+		config.denyAllGrants = true
+	}
 	config.modelIndex = make(map[string]int)
-	for _, item := range cfg.Get("models").Array() {
+	config.aliasIndex = make(map[string]int)
+	modelsNode := cfg.Get("models")
+	if config.unified && modelsNode.Exists() && modelsNode.Type != gjson.Null && !modelsNode.IsArray() {
+		config.denyAllGrants = true
+		return nil
+	}
+	for _, item := range modelsNode.Array() {
 		id := strings.TrimSpace(item.Get("id").String())
+		if id == "" {
+			id = strings.TrimSpace(item.Get("canonicalId").String())
+		}
 		if id == "" {
 			return errors.New("models[].id must not be empty")
 		}
@@ -99,14 +118,40 @@ func parseConfig(cfg gjson.Result, config *Config) error {
 		if modelCreated <= 0 {
 			modelCreated = created
 		}
-		config.modelIndex[id] = len(config.models)
-		config.models = append(config.models, Model{ID: id, OwnedBy: ownedBy, Created: modelCreated})
+		model := Model{ID: id, OwnedBy: ownedBy, Created: modelCreated, ListAliases: item.Get("listAliases").Bool()}
+		for _, alias := range item.Get("aliases").Array() {
+			name := strings.TrimSpace(alias.String())
+			if name == "" || name == id {
+				continue
+			}
+			if _, dup := config.modelIndex[name]; dup {
+				return fmt.Errorf("alias %q collides with a canonical model id", name)
+			}
+			if _, dup := config.aliasIndex[name]; dup {
+				return fmt.Errorf("duplicate model alias %q", name)
+			}
+			model.Aliases = append(model.Aliases, name)
+		}
+		idx := len(config.models)
+		config.modelIndex[id] = idx
+		config.aliasIndex[id] = idx
+		for _, name := range model.Aliases {
+			config.aliasIndex[name] = idx
+		}
+		config.models = append(config.models, model)
 	}
 	if len(config.models) == 0 {
+		if config.unified {
+			config.denyAllGrants = true
+			return nil
+		}
 		return errors.New("at least one entry in models is required")
 	}
-
 	config.consumers = make(map[string]map[string]struct{})
+	consumersNode := cfg.Get("consumers")
+	if config.unified && consumersNode.Exists() && consumersNode.Type != gjson.Null && !consumersNode.IsObject() {
+		config.denyAllGrants = true
+	}
 	cfg.Get("consumers").ForEach(func(name, models gjson.Result) bool {
 		consumer := strings.TrimSpace(name.String())
 		if consumer == "" {
@@ -118,19 +163,59 @@ func parseConfig(cfg gjson.Result, config *Config) error {
 			if id == "" {
 				continue
 			}
-			if _, known := config.modelIndex[id]; !known {
+			idx, known := config.aliasIndex[id]
+			if !known {
 				// An entitlement pointing at a model we were never told about is a
 				// sync bug upstream. Dropping the entry degrades one consumer's
 				// list; rejecting the config would take the whole route down.
 				log.Warnf("consumer %q references unknown model %q, ignored", consumer, id)
 				continue
 			}
-			allowed[id] = struct{}{}
+			allowed[config.models[idx].ID] = struct{}{}
 		}
 		config.consumers[consumer] = allowed
 		return true
 	})
+	if config.unified && (config.denyAllGrants || len(config.consumers) == 0) {
+		config.denyAllGrants = true
+	}
 	return nil
+}
+
+func catalogVersionInvalid(cfg gjson.Result) bool {
+	v := strings.TrimSpace(cfg.Get("version").String())
+	if v == "" {
+		v = strings.TrimSpace(cfg.Get("registryVersion").String())
+	}
+	if v == "" {
+		v = strings.TrimSpace(cfg.Get("schemaVersion").String())
+	}
+	return v != "" && v != "unified-model.v1" && !strings.HasPrefix(v, "unified-model.")
+}
+
+func isUnifiedCatalogConfig(cfg gjson.Result) bool {
+	v := strings.TrimSpace(cfg.Get("version").String())
+	if v == "" {
+		v = strings.TrimSpace(cfg.Get("registryVersion").String())
+	}
+	if v == "" {
+		v = strings.TrimSpace(cfg.Get("schemaVersion").String())
+	}
+	if v == "unified-model.v1" || strings.HasPrefix(v, "unified-model.") {
+		return true
+	}
+	if cfg.Get("registry").Exists() {
+		return true
+	}
+	for _, item := range cfg.Get("models").Array() {
+		if strings.TrimSpace(item.Get("canonicalId").String()) != "" ||
+			strings.TrimSpace(item.Get("groupKey").String()) != "" ||
+			(item.Get("aliases").Exists() && item.Get("aliases").IsArray() && len(item.Get("aliases").Array()) > 0) ||
+			item.Get("capabilities").Exists() {
+			return true
+		}
+	}
+	return false
 }
 
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config Config) types.Action {
@@ -150,6 +235,9 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config Config) types.Action {
 		// absence means the request was never authenticated, and answering would
 		// hand the whole catalog to an anonymous client.
 		return sendError(401, "invalid_request_error", "request is not authenticated")
+	}
+	if config.denyAllGrants {
+		return sendError(403, "invalid_request_error", "unified catalog has no consumer grants")
 	}
 
 	// A consumer with no entry is authenticated but not yet entitled to anything
@@ -212,13 +300,25 @@ func sendModelList(config Config, allowed map[string]struct{}) types.Action {
 			continue
 		}
 		body.Data = append(body.Data, toModelObject(model))
+		if !model.ListAliases {
+			continue
+		}
+		for _, alias := range model.Aliases {
+			aliasModel := model
+			aliasModel.ID = alias
+			body.Data = append(body.Data, toModelObject(aliasModel))
+		}
 	}
 	return sendJSON(200, body)
 }
 
 func sendSingleModel(config Config, allowed map[string]struct{}, id string) types.Action {
-	if _, ok := allowed[id]; ok {
-		return sendJSON(200, toModelObject(config.models[config.modelIndex[id]]))
+	idx, known := config.aliasIndex[id]
+	if known {
+		model := config.models[idx]
+		if _, ok := allowed[model.ID]; ok {
+			return sendJSON(200, toModelObject(model))
+		}
 	}
 	// Unknown and not-entitled are deliberately the same answer: telling an
 	// unentitled caller that a model exists leaks the private catalog.
