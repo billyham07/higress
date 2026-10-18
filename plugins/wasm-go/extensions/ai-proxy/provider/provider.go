@@ -1324,7 +1324,7 @@ func stripClaudeInternalMessageFields(body []byte, preserveMessageReasoningConte
 		}
 	}
 
-	messages := gjson.GetBytes(body, "messages")
+	messages := gjson.GetBytes(result, "messages")
 	if !messages.IsArray() {
 		return result
 	}
@@ -1341,13 +1341,37 @@ func stripClaudeInternalMessageFields(body []byte, preserveMessageReasoningConte
 		fields = append(fields, "reasoning_content")
 	}
 
-	for _, field := range fields {
-		messages.ForEach(func(key, _ gjson.Result) bool {
-			if updated, err := sjson.DeleteBytes(result, fmt.Sprintf("messages.%d.%s", key.Int(), field)); err == nil {
-				result = updated
+	// Strip each message on its own and write the array back once. Deleting
+	// "messages.N.field" from the whole body rescans and copies the body per
+	// field per message, which is quadratic: a claude-cli session carrying a
+	// hundred screenshots (13 MB, ~330 messages after conversion) spent over
+	// two minutes here before the request left the gateway.
+	stripped := make([]byte, 0, len(messages.Raw))
+	stripped = append(stripped, '[')
+	changed := false
+	messages.ForEach(func(key, message gjson.Result) bool {
+		raw := []byte(message.Raw)
+		for _, field := range fields {
+			if !message.Get(field).Exists() {
+				continue
 			}
-			return true
-		})
+			if updated, err := sjson.DeleteBytes(raw, field); err == nil {
+				raw = updated
+				changed = true
+			}
+		}
+		if key.Int() > 0 {
+			stripped = append(stripped, ',')
+		}
+		stripped = append(stripped, raw...)
+		return true
+	})
+	if !changed {
+		return result
+	}
+	stripped = append(stripped, ']')
+	if updated, err := sjson.SetRawBytes(result, "messages", stripped); err == nil {
+		result = updated
 	}
 	return result
 }
