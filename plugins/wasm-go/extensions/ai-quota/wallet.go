@@ -37,6 +37,11 @@ import (
 // A key never holds tokens of its own. Its cap only decides whether it may
 // keep spending the wallet, so a set of capped keys need not add up to the
 // account's allowance, and an uncapped key spends the account directly.
+//
+// media-gen (infra/media-gen) spends the same wallets for its paid Bailian
+// jobs: same admission rules at submit, this charge script plus a per-job
+// marker after the job succeeded. A change to the fields or to admission here
+// is a change there too.
 const (
 	quotaKeyPrefix    = "quota_key:"
 	quotaWalletPrefix = "quota_wallet:"
