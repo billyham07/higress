@@ -1,0 +1,85 @@
+# Isolated-gateway template. Default paths and service identity are the frozen
+# ai-credits.v1 contract; v2 must serve these endpoints with service-key auth.
+# mode=off leaves existing Token quota behaviour unchanged.
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: ai-credits
+  namespace: higress-system
+  labels:
+    app.kubernetes.io/name: ai-credits
+    app.kubernetes.io/part-of: unified-model-credits
+spec:
+  url: file:///opt/plugins/ai-credits/plugin.wasm
+  phase: UNSPECIFIED_PHASE
+  priority: 270
+  failStrategy: FAIL_CLOSE
+  defaultConfigDisable: false
+  defaultConfig:
+    mode: off
+    serviceKey: "REPLACE_WITH_V2_AI_CREDITS_SERVICE_KEY"
+    consumerHeader: x-mse-consumer
+    authHeader: X-AI-Credits-Service-Key
+    admitPath: /internal/ai-credits/v1/admit
+    settlePath: /internal/ai-credits/v1/settle
+    timeout: 1000
+    service:
+      name: higress-ai-key-admin-v2.higress-system.svc.cluster.local
+      port: 80
+    # The durable settlement channel. Omit it and an undelivered settlement
+    # survives only in the gateway log; configure it and the payload is written
+    # to Redis before the settle call, then waits for Redis 7.2 WAITAOF local
+    # fsync confirmation. v2 removes it after acknowledging the settlement, so
+    # the credits job can replay whatever this gateway could not deliver.
+    # Redis here is the instance v2 reads: the key is a shared contract.
+    #
+    # service_name is an McpBridge registry entry, not a DNS name -- the Redis
+    # host call validates the cluster and refuses anything the registry does not
+    # carry with "bad argument". `redis.dns` is the entry production's bridge
+    # already has (`name: redis`, `type: dns`), which ai-quota uses too.
+    settlementOutbox:
+      service_name: redis.dns
+      service_port: 6379
+      timeout: 1000
+      database: 0
+      key: v2:credits:settle:outbox
+    enablePathSuffixes:
+      - /v1/chat/completions
+      - /v1/messages
+      - /v1/responses
+      - /chat/completions
+      - /messages
+      - /responses
+    registry:
+      version: unified-model.v1
+      defaultGroupKey: h20
+      stripClientHeaders:
+        - x-higress-llm-model
+        - x-higress-llm-provider
+        - x-ai-credits-budget-subject
+        - x-ai-credits-reservation-id
+        - x-ai-credits-request-id
+        - x-ai-credits-canonical-model
+      models: []
+---
+# model-router published mapping (apply only when v2 has published models).
+# Keep modelToHeader so existing Ingress exact-match continues to work.
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: model-router-unified
+  namespace: higress-system
+spec:
+  url: file:///opt/plugins/model-router/plugin.wasm
+  defaultConfig:
+    modelKey: model
+    modelToHeader: x-higress-llm-model
+    enableOnPathSuffix:
+      - /completions
+      - /embeddings
+      - /messages
+      - /responses
+    registry:
+      version: unified-model.v1
+      defaultGroupKey: h20
+      models: []

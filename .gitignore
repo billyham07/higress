@@ -20,3 +20,5 @@ istio/1.12
 
 # Local working notes (design specs, implementation plans) — not for upstream PRs
 docs/superpowers/
+*.exe
+go-test-*.log
