@@ -133,6 +133,12 @@ type ClaudeToOpenAIConvertOptions struct {
 	// PreserveMessageReasoningContent enables the non-standard message-level
 	// reasoning_content field for providers that explicitly support it.
 	PreserveMessageReasoningContent bool
+	// DropClaudeContentBlocks leaves out claude_content_blocks, the copy of the
+	// original Claude blocks that only the Claude and Bedrock providers read
+	// back. Every other provider strips it again, and for image-heavy agent
+	// sessions it doubles the body: a 31 MB request became 62 MB and ran the
+	// plugin VM out of its 1 GiB on 2026-11-03.
+	DropClaudeContentBlocks bool
 }
 
 func (r *contentConversionResult) reasoningContent() string {
@@ -147,7 +153,9 @@ func (r *contentConversionResult) setReasoningContent(message *chatMessage, opti
 
 func applyReasoningFields(message *chatMessage, conversionResult *contentConversionResult, options ClaudeToOpenAIConvertOptions) {
 	conversionResult.setReasoningContent(message, options)
-	message.ClaudeContentBlocks = conversionResult.claudeContentBlocks
+	if !options.DropClaudeContentBlocks {
+		message.ClaudeContentBlocks = conversionResult.claudeContentBlocks
+	}
 }
 
 // ConvertClaudeRequestToOpenAI converts a Claude chat completion request to strict OpenAI format.
@@ -160,7 +168,7 @@ func (c *ClaudeToOpenAIConverter) ConvertClaudeRequestToOpenAI(body []byte) ([]b
 
 // ConvertClaudeRequestToOpenAIWithOptions converts a Claude chat completion request to OpenAI format.
 func (c *ClaudeToOpenAIConverter) ConvertClaudeRequestToOpenAIWithOptions(body []byte, options ClaudeToOpenAIConvertOptions) ([]byte, error) {
-	log.Debugf("[Claude->OpenAI] Original Claude request body: %s", string(body))
+	log.Debugf("[Claude->OpenAI] Original Claude request body: %s", body)
 
 	var claudeRequest claudeTextGenRequest
 	if err := json.Unmarshal(body, &claudeRequest); err != nil {
@@ -240,10 +248,12 @@ func (c *ClaudeToOpenAIConverter) ConvertClaudeRequestToOpenAIWithOptions(body [
 						}
 					}
 					toolMsg := chatMessage{
-						Role:                "tool",
-						Content:             text,
-						ToolCallId:          toolResult.ToolUseId,
-						ClaudeContentBlocks: []claudeChatMessageContent{toolResult},
+						Role:       "tool",
+						Content:    text,
+						ToolCallId: toolResult.ToolUseId,
+					}
+					if !options.DropClaudeContentBlocks {
+						toolMsg.ClaudeContentBlocks = []claudeChatMessageContent{toolResult}
 					}
 					openaiRequest.Messages = append(openaiRequest.Messages, toolMsg)
 				}
@@ -412,7 +422,7 @@ func computeClaudeInputTokens(u *usage) int {
 
 // ConvertOpenAIResponseToClaude converts an OpenAI response back to Claude format
 func (c *ClaudeToOpenAIConverter) ConvertOpenAIResponseToClaude(ctx wrapper.HttpContext, body []byte) ([]byte, error) {
-	log.Debugf("[OpenAI->Claude] Original OpenAI response body: %s", string(body))
+	log.Debugf("[OpenAI->Claude] Original OpenAI response body: %s", body)
 
 	var openaiResponse chatCompletionResponse
 	if err := json.Unmarshal(body, &openaiResponse); err != nil {

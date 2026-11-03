@@ -51,7 +51,7 @@ func replaceJsonRequestBody(request interface{}) error {
 	if err != nil {
 		return fmt.Errorf("unable to marshal request: %v", err)
 	}
-	log.Debugf("request body: %s", string(body))
+	log.Debugf("request body: %s", body)
 	err = proxywasm.ReplaceHttpRequestBody(body)
 	if err != nil {
 		return fmt.Errorf("unable to replace the original request body: %v", err)
@@ -60,7 +60,7 @@ func replaceJsonRequestBody(request interface{}) error {
 }
 
 func replaceRequestBody(body []byte) error {
-	log.Debugf("request body: %s", string(body))
+	log.Debugf("request body: %s", body)
 	err := proxywasm.ReplaceHttpRequestBody(body)
 	if err != nil {
 		return fmt.Errorf("unable to replace the original request body: %v", err)
@@ -222,7 +222,7 @@ func mergeReasoningContent(prev, curr string) string {
 }
 
 func ReplaceResponseBody(body []byte) error {
-	log.Debugf("response body: %s", string(body))
+	log.Debugf("response body: %s", body)
 	err := proxywasm.ReplaceHttpResponseBody(body)
 	if err != nil {
 		return fmt.Errorf("unable to replace the original response body: %v", err)

@@ -1237,8 +1237,10 @@ func (c *ProviderConfig) handleRequestBody(
 
 		// Convert Claude protocol to OpenAI protocol
 		converter := &ClaudeToOpenAIConverter{}
+		readsClaudeBlocks := provider.GetProviderType() == providerTypeBedrock || provider.GetProviderType() == providerTypeClaude
 		body, err = converter.ConvertClaudeRequestToOpenAIWithOptions(body, ClaudeToOpenAIConvertOptions{
 			PreserveMessageReasoningContent: c.supportsMessageReasoningContent(),
+			DropClaudeContentBlocks:         !readsClaudeBlocks,
 		})
 		if err != nil {
 			return types.ActionContinue, fmt.Errorf("failed to convert claude request to openai: %v", err)
@@ -1319,6 +1321,10 @@ func (c *ProviderConfig) handleRequestBody(
 func stripClaudeInternalMessageFields(body []byte, preserveMessageReasoningContent ...bool) []byte {
 	result := body
 	for _, field := range []string{"claude_thinking", "claude_output_config", "claude_anthropic_beta"} {
+		// sjson copies the whole body even when the field is absent.
+		if !gjson.GetBytes(result, field).Exists() {
+			continue
+		}
 		if updated, err := sjson.DeleteBytes(result, field); err == nil {
 			result = updated
 		}
@@ -1346,6 +1352,22 @@ func stripClaudeInternalMessageFields(body []byte, preserveMessageReasoningConte
 	// field per message, which is quadratic: a claude-cli session carrying a
 	// hundred screenshots (13 MB, ~330 messages after conversion) spent over
 	// two minutes here before the request left the gateway.
+	// Most requests carry none of these fields; leave the body alone rather
+	// than copying every message into a second buffer of the same size.
+	present := false
+	messages.ForEach(func(_, message gjson.Result) bool {
+		for _, field := range fields {
+			if message.Get(field).Exists() {
+				present = true
+				return false
+			}
+		}
+		return true
+	})
+	if !present {
+		return result
+	}
+
 	stripped := make([]byte, 0, len(messages.Raw))
 	stripped = append(stripped, '[')
 	changed := false
