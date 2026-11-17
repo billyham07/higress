@@ -1968,3 +1968,37 @@ func companionContents(t *testing.T, message chatMessage) []chatMessageContent {
 	require.NoError(t, json.Unmarshal(encoded, &parts))
 	return parts
 }
+
+func TestConvertClaudeRequestToOpenAI_DropClaudeContentBlocks(t *testing.T) {
+	claudeRequest := `{
+		"model": "deepseek-v4.1-flash",
+		"max_tokens": 16,
+		"messages": [
+			{"role": "user", "content": "look"},
+			{"role": "assistant", "content": [
+				{"type": "thinking", "thinking": "need a screenshot", "signature": "sig"},
+				{"type": "tool_use", "id": "toolu_1", "name": "screenshot", "input": {}}
+			]},
+			{"role": "user", "content": [
+				{"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+					{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+				]}
+			]}
+		]
+	}`
+	converter := &ClaudeToOpenAIConverter{}
+
+	kept, err := converter.ConvertClaudeRequestToOpenAI([]byte(claudeRequest))
+	require.NoError(t, err)
+	assert.Contains(t, string(kept), `"claude_content_blocks"`)
+
+	dropped, err := converter.ConvertClaudeRequestToOpenAIWithOptions([]byte(claudeRequest), ClaudeToOpenAIConvertOptions{
+		DropClaudeContentBlocks: true,
+	})
+	require.NoError(t, err)
+	assert.NotContains(t, string(dropped), `"claude_content_blocks"`)
+	// The image is carried once, by the OpenAI content, not twice.
+	assert.Equal(t, 1, strings.Count(string(dropped), "iVBORw0KGgo="))
+	assert.Equal(t, 2, strings.Count(string(kept), "iVBORw0KGgo="))
+	assert.Contains(t, string(dropped), `"tool_call_id":"toolu_1"`)
+}

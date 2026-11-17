@@ -98,7 +98,7 @@ func TestATokenPriceIsUnaffectedByTheStatusGate(t *testing.T) {
 		// The upstream answered, generated real tokens, then the stream broke.
 		// The tokens were produced; refunding them because the connection died
 		// afterwards would be the wrong correction.
-		host.CallOnHttpResponseHeaders([][2]string{{":status", "500"}})
+		host.CallOnHttpResponseHeaders([][2]string{{":status", "500"}, {"content-type", "text/event-stream"}})
 		host.CallOnHttpStreamingResponseBody(
 			[]byte(`data: {"choices":[],"usage":{"prompt_tokens":10000,"completion_tokens":2000,"total_tokens":12000}}`), false)
 

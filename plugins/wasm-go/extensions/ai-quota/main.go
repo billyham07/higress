@@ -59,6 +59,12 @@ const (
 	// DontReadRequestBody: buffering every prompt to learn one field would
 	// cost far more than the charge it enables.
 	modelHeader = "x-higress-llm-model"
+
+	streamingContentType = "text/event-stream"
+	// The gateway's downstream connection buffer limit (32KiB) also caps a
+	// buffered response, so a larger non-streaming body would fail the request
+	// unless the encoder limit is raised. Same ceiling as ai-proxy.
+	responseBodyBufferLimit uint32 = 100 * 1024 * 1024
 )
 
 type ChatMode string
@@ -80,6 +86,7 @@ func init() {
 		wrapper.ProcessRequestBody(onHttpRequestBody),
 		wrapper.ProcessResponseHeaders(onHttpResponseHeaders),
 		wrapper.ProcessStreamingResponseBody(onHttpStreamingResponseBody),
+		wrapper.ProcessResponseBody(onHttpResponseBody),
 	)
 }
 
@@ -250,13 +257,26 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig) types
 	return types.HeaderStopAllIterationAndWatermark
 }
 
-// onHttpResponseHeaders records the upstream's status.
+// onHttpResponseHeaders records the upstream's status, and buffers a
+// non-streaming response. Envoy may hand a JSON body over in several chunks,
+// and the usage object at its end cannot be parsed out of a fragment that does
+// not start at the top-level object, so the request would go uncharged. Only
+// an SSE response is parsed chunk by chunk.
 //
 // The plugin has never needed it: under token pricing a failed request
 // reports no usage, so it costs nothing without anybody checking. A
 // per-request price has no such protection -- it charges for the attempt --
 // so the status has to be captured before the body callback wants it.
 func onHttpResponseHeaders(ctx wrapper.HttpContext, config QuotaConfig) types.Action {
+	if chatMode, ok := ctx.GetContext("chatMode").(ChatMode); !ok || chatMode != ChatModeCompletion {
+		ctx.DontReadResponseBody()
+	} else {
+		contentType, _ := proxywasm.GetHttpResponseHeader("content-type")
+		if !strings.Contains(strings.ToLower(contentType), streamingContentType) {
+			ctx.BufferResponseBody()
+			ctx.SetResponseBodyBufferLimit(responseBodyBufferLimit)
+		}
+	}
 	status, err := proxywasm.GetHttpResponseHeader(":status")
 	if err != nil {
 		log.Warnf("no response status available: %v", err)
@@ -300,13 +320,33 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config QuotaConfig, body []byte)
 	return types.ActionContinue
 }
 
+func onHttpResponseBody(ctx wrapper.HttpContext, config QuotaConfig, body []byte) types.Action {
+	if recordResponseUsage(ctx, body) {
+		chargeQuotaOnce(ctx, config)
+	}
+	return types.ActionContinue
+}
+
 func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config QuotaConfig, data []byte, endOfStream bool) []byte {
-	chatMode, ok := ctx.GetContext("chatMode").(ChatMode)
-	if !ok {
+	if !recordResponseUsage(ctx, data) {
 		return data
 	}
-	if chatMode != ChatModeCompletion {
+
+	// SSE clients often stop reading after a protocol-level terminal frame without
+	// waiting for transport EOF. Charge on that semantic end as well as the normal
+	// endOfStream callback, with an exactly-once guard.
+	if !endOfStream && !isSemanticStreamEnd(ctx, data) {
 		return data
+	}
+	chargeQuotaOnce(ctx, config)
+	return data
+}
+
+// recordResponseUsage keeps the usage found in data, and reports whether the
+// request is one the quota governs.
+func recordResponseUsage(ctx wrapper.HttpContext, data []byte) bool {
+	if chatMode, ok := ctx.GetContext("chatMode").(ChatMode); !ok || chatMode != ChatModeCompletion {
+		return false
 	}
 	usage := tokenusage.GetTokenUsage(ctx, data)
 	enrichAnthropicStreamingUsage(ctx, data, &usage)
@@ -330,22 +370,15 @@ func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config QuotaConfig, da
 			ctx.SetContext(quotaSecondsContextKey, seconds)
 		}
 	}
-
-	// SSE clients often stop reading after a protocol-level terminal frame without
-	// waiting for transport EOF. Charge on that semantic end as well as the normal
-	// endOfStream callback, with an exactly-once guard.
-	if !endOfStream && !isSemanticStreamEnd(ctx, data) {
-		return data
-	}
-	chargeQuotaOnce(ctx, config)
-	return data
+	return true
 }
 
 func chargeQuotaOnce(ctx wrapper.HttpContext, config QuotaConfig) {
 	if ctx.GetBoolContext(quotaChargedContextKey, false) {
 		return
 	}
-	if ctx.GetContext("consumer") == nil {
+	consumer, ok := ctx.GetContext("consumer").(string)
+	if !ok || consumer == "" {
 		return
 	}
 
@@ -356,7 +389,6 @@ func chargeQuotaOnce(ctx wrapper.HttpContext, config QuotaConfig) {
 	}
 	amount := config.scale(base)
 
-	consumer := ctx.GetContext("consumer").(string)
 	log.Debugf("update consumer:%s, model:%s, base:%d, multiplier:%d%%, charge:%d",
 		consumer, model, base, config.MultiplierPercent, amount)
 	// A free route is not a Redis round trip: every request on self-hosted
