@@ -833,3 +833,23 @@ func TestStripClaudeInternalMessageFields(t *testing.T) {
 	assert.False(t, gjson.GetBytes(preserved, "messages.0.reasoning_signature").Exists())
 	assert.False(t, gjson.GetBytes(preserved, "messages.0.claude_content_blocks").Exists())
 }
+
+func TestConvertDeveloperRoleToSystem(t *testing.T) {
+	body := []byte(`{"model":"m","vendor_field":{"k":1},"messages":[{"role":"developer","content":"rules"},{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}],"x_extra":true},{"role":"developer","content":"more"}]}`)
+	out, err := convertDeveloperRoleToSystem(body)
+	assert.NoError(t, err)
+	assert.Equal(t, "system", gjson.GetBytes(out, "messages.0.role").String())
+	assert.Equal(t, "user", gjson.GetBytes(out, "messages.1.role").String())
+	assert.Equal(t, "system", gjson.GetBytes(out, "messages.2.role").String())
+	// fields the request struct does not model must survive
+	assert.Equal(t, int64(1), gjson.GetBytes(out, "vendor_field.k").Int())
+	assert.True(t, gjson.GetBytes(out, "messages.1.x_extra").Bool())
+
+	unchanged := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	out, err = convertDeveloperRoleToSystem(unchanged)
+	assert.NoError(t, err)
+	assert.Equal(t, string(unchanged), string(out))
+
+	_, err = convertDeveloperRoleToSystem([]byte(`{"messages":[`))
+	assert.Error(t, err)
+}

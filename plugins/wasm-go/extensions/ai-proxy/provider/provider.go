@@ -2,7 +2,6 @@ package provider
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -1075,24 +1074,32 @@ func isDeveloperRoleSupported(providerType string) bool {
 
 // convertDeveloperRoleToSystem converts "developer" roles to "system" role in the request body.
 // This is used for providers that don't support the "developer" role.
+//
+// It runs on every chat request for most providers, so it must not decode the whole
+// body: a struct round-trip of a large multimodal request allocates several copies of
+// it inside a wasm VM capped at 1 GiB. Only the role values are read, and only the
+// matching role fields are rewritten, which also keeps fields chatCompletionRequest
+// does not model.
 func convertDeveloperRoleToSystem(body []byte) ([]byte, error) {
-	request := &chatCompletionRequest{}
-	if err := json.Unmarshal(body, request); err != nil {
-		return body, fmt.Errorf("unable to unmarshal request for developer role conversion: %v", err)
+	if !gjson.ValidBytes(body) {
+		return body, fmt.Errorf("unable to parse request for developer role conversion: invalid json")
 	}
-
-	converted := false
-	for i := range request.Messages {
-		if request.Messages[i].Role == roleDeveloper {
-			request.Messages[i].Role = roleSystem
-			converted = true
+	// "messages.#.role" yields only the role strings; fetching "messages" itself would
+	// copy the whole array out of the body.
+	var indexes []int
+	for i, role := range gjson.GetBytes(body, "messages.#.role").Array() {
+		if role.String() == roleDeveloper {
+			indexes = append(indexes, i)
 		}
 	}
 
-	if converted {
-		return json.Marshal(request)
+	var err error
+	for _, idx := range indexes {
+		body, err = sjson.SetBytes(body, fmt.Sprintf("messages.%d.role", idx), roleSystem)
+		if err != nil {
+			return body, fmt.Errorf("unable to rewrite developer role: %v", err)
+		}
 	}
-
 	return body, nil
 }
 
